@@ -2105,7 +2105,9 @@ public static partial class Commands
     {
         if (!File.Exists(path))
         {
-            File.WriteAllText(path, content.ReplaceLineEndings("\n"), Utf8NoBom);
+            // Text files end with a newline, so text appended later starts on a line of its own.
+            var text = content.ReplaceLineEndings("\n");
+            File.WriteAllText(path, text.Length == 0 || text.EndsWith('\n') ? text : text + "\n", Utf8NoBom);
         }
     }
 

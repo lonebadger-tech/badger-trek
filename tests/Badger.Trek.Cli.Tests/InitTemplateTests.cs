@@ -27,6 +27,7 @@ public sealed class InitTemplateTests : IDisposable
         var dir = Path.Combine(root, provider);
         Assert.Equal(0, Commands.Init(G(dir), provider));
         Assert.Equal(0, Commands.PlanCheck(G(dir)));
+        Assert.EndsWith("\n", File.ReadAllText(Path.Combine(dir, TrekConfig.FileName)), StringComparison.Ordinal);
 
         var config = TrekConfig.Load(dir);
         var created = config.CreateProvider();
