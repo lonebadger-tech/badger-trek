@@ -24,9 +24,22 @@ public sealed class SplitterAndLinterTests
             ;
             """);
         Assert.Equal(
-            ["CREATE TABLE t (id NUMBER, note VARCHAR2(20) DEFAULT 'a;b')", "INSERT INTO t (id, note) VALUES (1, q'[it's; fine]')", "INSERT INTO t VALUES (2, 'x')", "/* block; comment */\nCOMMENT ON TABLE t IS 'one\ntwo; three'"],
+            ["CREATE TABLE t (id NUMBER, note VARCHAR2(20) DEFAULT 'a;b')", "INSERT INTO t (id, note) VALUES (1, q'[it's; fine]')", "INSERT INTO t VALUES (2, 'x')", "COMMENT ON TABLE t IS 'one\ntwo; three'"],
             batches.Select(b => b.Text));
-        Assert.Equal([1, 3, 3, 4], batches.Select(b => b.StartLine));
+        Assert.Equal([1, 3, 3, 5], batches.Select(b => b.StartLine));
+    }
+
+    [Fact]
+    public void A_script_of_only_comments_has_no_statements()
+    {
+        Assert.Empty(Split("""
+            -- trek:requires views/other.sql
+            /* REVIEW trek convert: function not translated to Oracle; rewrite it */
+            -- CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;
+            /* a comment
+               over two lines; with a semicolon */
+            """));
+        Assert.Equal(["SELECT 'it''s /* not a comment */' FROM dual"], Split("/* lead */ SELECT 'it''s /* not a comment */' FROM dual;").Select(b => OracleStatementSplitter.StripComments(b.Text).Trim()));
     }
 
     [Fact]

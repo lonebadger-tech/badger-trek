@@ -2,12 +2,13 @@ using System.Text;
 
 namespace Badger.Trek.Conversion.PgToTSql;
 
-/// <summary>The dialect <see cref="PgLexer"/> and <see cref="PgParser"/> read: PostgreSQL, or SQLite or MySQL when converting from them.</summary>
+/// <summary>The dialect <see cref="PgLexer"/> and <see cref="PgParser"/> read: PostgreSQL, or SQLite, MySQL or Oracle when converting from them.</summary>
 internal enum ParseMode
 {
     PostgreSql,
     Sqlite,
     MySql,
+    Oracle,
 }
 
 internal enum TokenKind
@@ -44,12 +45,14 @@ internal static class PgLexer
     /// <param name="mode">
     /// SQLite also reads [name] and `name` identifiers. MySQL (its default SQL mode) reads `name` identifiers, strings
     /// in single or double quotes with backslash escapes, # comments, &lt;=&gt;, x'..' / b'..' / 0x.. literals and
-    /// charset introducers (_utf8mb4'..'), which SHOW CREATE VIEW writes before every string.
+    /// charset introducers (_utf8mb4'..'), which SHOW CREATE VIEW writes before every string. Oracle reads q'[..]'
+    /// alternative quoting, N'..' strings and # in names, and has no E'..' strings, dollar quoting or $n parameters.
     /// </param>
     public static List<Token> Tokenize(string text, ParseMode mode = ParseMode.PostgreSql)
     {
         var sqlite = mode == ParseMode.Sqlite;
         var mysql = mode == ParseMode.MySql;
+        var oracle = mode == ParseMode.Oracle;
         var tokens = new List<Token>();
         var i = 0;
         while (i < text.Length)
@@ -103,7 +106,13 @@ internal static class PgLexer
                 continue;
             }
 
-            if (!mysql && (c is 'E' or 'e') && At(text, i + 1) == '\'')
+            if (oracle && OracleToken(text, ref i) is { } oracleToken)
+            {
+                tokens.Add(oracleToken);
+                continue;
+            }
+
+            if (!mysql && !oracle && (c is 'E' or 'e') && At(text, i + 1) == '\'')
             {
                 i++;
                 var value = ReadQuoted(text, ref i, '\'', escapes: true);
@@ -141,7 +150,7 @@ internal static class PgLexer
                 continue;
             }
 
-            if (!mysql && c == '$' && DollarTag(text, i) is { } tag)
+            if (!mysql && !oracle && c == '$' && DollarTag(text, i) is { } tag)
             {
                 var close = text.IndexOf(tag, i + tag.Length, StringComparison.Ordinal);
                 var end = close < 0 ? text.Length : close + tag.Length;
@@ -151,7 +160,7 @@ internal static class PgLexer
                 continue;
             }
 
-            if (!mysql && c == '$' && char.IsDigit(At(text, i + 1)))
+            if (!mysql && !oracle && c == '$' && char.IsDigit(At(text, i + 1)))
             {
                 i++;
                 while (i < text.Length && char.IsDigit(text[i]))
@@ -185,7 +194,7 @@ internal static class PgLexer
 
             if (char.IsLetter(c) || c == '_' || c > 127)
             {
-                while (i < text.Length && (char.IsLetterOrDigit(text[i]) || text[i] is '_' or '$' || text[i] > 127))
+                while (i < text.Length && (char.IsLetterOrDigit(text[i]) || text[i] is '_' or '$' || (oracle && text[i] == '#') || text[i] > 127))
                 {
                     i++;
                 }
@@ -282,6 +291,39 @@ internal static class PgLexer
         {
             i += 3;
             return new Token(TokenKind.Operator, "<=>", "<=>", start, i);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The Oracle-only token starting at i, or null: q'[..]' alternative quoting (any delimiter; [ ( { &lt; close with
+    /// their pair) and N'..' / NQ'..' national strings.
+    /// </summary>
+    private static Token? OracleToken(string text, ref int i)
+    {
+        var start = i;
+        var j = i;
+        if (text[j] is 'N' or 'n' && At(text, j + 1) is '\'' or 'q' or 'Q')
+        {
+            j++;
+        }
+
+        if (text[j] is 'q' or 'Q' && At(text, j + 1) == '\'' && j + 2 < text.Length)
+        {
+            var open = text[j + 2];
+            var close = open switch { '[' => ']', '(' => ')', '{' => '}', '<' => '>', _ => open };
+            var end = text.IndexOf(close + "'", j + 3, StringComparison.Ordinal);
+            var value = text[(j + 3)..(end < 0 ? text.Length : end)];
+            i = end < 0 ? text.Length : end + 2;
+            return new Token(TokenKind.String, text[start..i], value, start, i);
+        }
+
+        if (j > i && text[j] == '\'')
+        {
+            i = j;
+            var value = ReadQuoted(text, ref i, '\'', escapes: false);
+            return new Token(TokenKind.String, text[start..i], value, start, i);
         }
 
         return null;

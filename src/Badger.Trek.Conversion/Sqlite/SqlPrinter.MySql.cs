@@ -35,6 +35,12 @@ internal sealed partial class SqlPrinter
     {
         var t = type.Replace(" unsigned", string.Empty, StringComparison.Ordinal).Trim();
         var name = t.Split('(')[0].Trim();
+        if (ctx.Source == Dialect.Oracle)
+        {
+            // NUMBER(p) and NUMBER(p, 0) hold whole numbers; INTEGER is NUMBER(38).
+            return name is "integer" or "int" or "smallint" || Regex.IsMatch(t, @"^number\s*\(\s*\d+\s*(,\s*0\s*)?\)$");
+        }
+
         return ctx.Source == Dialect.MySql
             ? name is "tinyint" or "smallint" or "mediumint" or "int" or "integer" or "bigint" or "signed" && !t.StartsWith("tinyint(1)", StringComparison.Ordinal)
             : name is "smallint" or "integer" or "int" or "bigint" or "int2" or "int4" or "int8" or "serial" or "bigserial" or "smallserial" or "signed";
@@ -46,6 +52,7 @@ internal sealed partial class SqlPrinter
         PgLiteral { Kind: LiteralKind.Number } n => !n.Value.Contains('.', StringComparison.Ordinal) && !n.Value.Contains('e', StringComparison.OrdinalIgnoreCase),
         PgCast c => IsIntegerType(c.Type.ToLowerInvariant()),
         PgName n => ColumnTypes(n, IsIntegerType),
+        PgCall { Function.Last: var f, Args: [var arg] } when f.ToLowerInvariant() is "sum" or "min" or "max" or "abs" => IsInteger(arg),
         PgCall { Function.Last: var f } => f.Equals("count", StringComparison.OrdinalIgnoreCase),
         PgUnary { Op: "-" or "+" } u => IsInteger(u.Operand),
         PgBinary { Op: "+" or "-" or "*" or "%" } b => IsInteger(b.Left) && IsInteger(b.Right),
@@ -66,6 +73,8 @@ internal sealed partial class SqlPrinter
     private bool MaybeNull(PgExpr e) => Unparen(e) switch
     {
         PgLiteral { Kind: not LiteralKind.Null } => false,
+        PgTypedLiteral => false,
+        PgCast c => MaybeNull(c.Operand),
         PgCall { Function.Last: var f } when f.Equals("count", StringComparison.OrdinalIgnoreCase) => false,
         PgName n => ColumnsNamed(n.Last) is not { Count: > 0 } columns || columns.Any(c => c.Nullable),
         _ => true,

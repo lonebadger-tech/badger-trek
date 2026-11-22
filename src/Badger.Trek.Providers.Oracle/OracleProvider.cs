@@ -52,6 +52,10 @@ public sealed partial class OracleProvider(OracleOptions options) : IDatabasePro
 
     public IScratchDatabases ScratchDatabases => new Scripting.OracleScratchDatabases(this);
 
+    public Core.Conversion.ISchemaExporter Exporter { get; } = new Conversion.OracleExporter();
+
+    public Core.Conversion.IDataTransfer Data { get; } = new Conversion.OracleDataTransfer();
+
     /// <summary>A schema is a user; trek works inside the environment's schema.</summary>
     public string DefaultSchema => string.Empty;
 

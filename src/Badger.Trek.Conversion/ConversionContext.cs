@@ -83,6 +83,13 @@ public sealed class ConversionContext
     {
         var t = sourceType.Trim().ToLowerInvariant();
         var name = t.Split('(')[0].Trim();
+        if (Source == Dialect.Oracle)
+        {
+            return name is "boolean" ? ColumnKind.Boolean
+                : name is "varchar2" or "nvarchar2" or "varchar" or "char" or "nchar" or "clob" or "nclob" or "long" ? ColumnKind.Text
+                : ColumnKind.Other;
+        }
+
         if (Source == Dialect.MySql)
         {
             return name is "bool" or "boolean" || t.StartsWith("tinyint(1)", StringComparison.Ordinal) ? ColumnKind.Boolean

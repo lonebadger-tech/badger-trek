@@ -1,8 +1,11 @@
 using System.Text.RegularExpressions;
 using Badger.Trek.Cli;
+using DotNet.Testcontainers.Builders;
+using DotNet.Testcontainers.Containers;
 using Microsoft.Data.SqlClient;
 using MySqlConnector;
 using Npgsql;
+using Oracle.ManagedDataAccess.Client;
 using Testcontainers.MsSql;
 using Testcontainers.MariaDb;
 using Testcontainers.MySql;
@@ -59,6 +62,7 @@ public sealed class Servers : IAsyncLifetime
 
         MySqlUnavailableReason = UnavailableReason;
         MariaDbUnavailableReason = UnavailableReason;
+        OracleUnavailableReason = UnavailableReason;
         if (UnavailableReason is not null)
         {
             return;
@@ -78,6 +82,32 @@ public sealed class Servers : IAsyncLifetime
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             MySqlUnavailableReason = $"MySQL could not start ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}). Start Docker or set TREK_TEST_MYSQL.";
+        }
+
+        // Oracle: TREK_TEST_ORACLE (an ODP.NET connection string for a user that may create users, such as SYSTEM on a
+        // pluggable database), or a container from TREK_TEST_ORACLE_IMAGE (default Oracle Database Free 26ai). Its tests
+        // also convert to and from MySQL, so they skip when MySQL is unavailable too.
+        OracleUnavailableReason = MySqlUnavailableReason;
+        if (OracleUnavailableReason is null)
+        {
+            try
+            {
+                Oracle = Environment.GetEnvironmentVariable("TREK_TEST_ORACLE");
+                if (string.IsNullOrWhiteSpace(Oracle))
+                {
+                    oracle = new ContainerBuilder(Environment.GetEnvironmentVariable("TREK_TEST_ORACLE_IMAGE") is { Length: > 0 } image ? image : "gvenzl/oracle-free:23-slim-faststart")
+                        .WithEnvironment("ORACLE_PASSWORD", OraclePassword)
+                        .WithPortBinding(1521, true)
+                        .WithWaitStrategy(Wait.ForUnixContainer().UntilMessageIsLogged("DATABASE IS READY TO USE!"))
+                        .Build();
+                    await oracle.StartAsync();
+                    Oracle = $"User Id=system;Password={OraclePassword};Data Source={oracle.Hostname}:{oracle.GetMappedPublicPort(1521)}/FREEPDB1";
+                }
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                OracleUnavailableReason = $"Oracle could not start ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}). Start Docker or set TREK_TEST_ORACLE.";
+            }
         }
 
         // MariaDB: TREK_TEST_MARIADB, or a container from TREK_TEST_MARIADB_IMAGE (default mariadb:11.4). Its tests
@@ -103,6 +133,49 @@ public sealed class Servers : IAsyncLifetime
         {
             MariaDbUnavailableReason = $"MariaDB could not start ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}). Start Docker or set TREK_TEST_MARIADB.";
         }
+    }
+
+    private const string OraclePassword = "Trek_test_1";
+
+    private IContainer? oracle;
+
+    /// <summary>An admin connection string (SYSTEM) to the Oracle pluggable database.</summary>
+    public string? Oracle { get; private set; }
+
+    /// <summary>Why the Oracle tests skip: no PostgreSQL, SQL Server or MySQL (the other sides), or no Oracle.</summary>
+    public string? OracleUnavailableReason { get; private set; }
+
+    /// <summary>A new schema (user) with a deploy login's privileges, optionally filled by a script; its connection string.</summary>
+    public async Task<string> CreateOracleAsync(string? script = null)
+    {
+        var name = "TREK_CONV_" + Guid.NewGuid().ToString("N")[..10].ToUpperInvariant();
+        await using (var admin = new OracleConnection(Oracle))
+        {
+            await admin.OpenAsync();
+            foreach (var sql in new[]
+            {
+                $"CREATE USER {name} IDENTIFIED BY \"{OraclePassword}\" QUOTA UNLIMITED ON USERS",
+                $"GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE, CREATE TRIGGER, CREATE SYNONYM, CREATE TYPE TO {name}",
+            })
+            {
+                await using var command = new OracleCommand(sql, admin);
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+
+        var cs = new OracleConnectionStringBuilder(Oracle) { UserID = name, Password = OraclePassword, Pooling = false }.ConnectionString;
+        if (script is not null)
+        {
+            await using var connection = new OracleConnection(cs);
+            await connection.OpenAsync();
+            foreach (var batch in new Badger.Trek.Providers.Oracle.OracleStatementSplitter().Split(script))
+            {
+                await using var command = new OracleCommand(batch.Text, connection);
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+
+        return cs;
     }
 
     public string? MariaDb { get; private set; }
@@ -152,6 +225,11 @@ public sealed class Servers : IAsyncLifetime
         if (mariaDb is not null)
         {
             await mariaDb.DisposeAsync();
+        }
+
+        if (oracle is not null)
+        {
+            await oracle.DisposeAsync();
         }
     }
 

@@ -110,6 +110,44 @@ internal static class Schemas
         return s;
     }
 
+    /// <summary>
+    /// An Oracle schema (SHOP) as ALL_TAB_COLUMNS reports it: upper-case names, NUMBER(1) for a flag, DATE (with a time of
+    /// day), DATA_DEFAULT and virtual-column expressions as Oracle writes them, and a sequence.
+    /// </summary>
+    public static PortableSchema Oracle()
+    {
+        var s = new PortableSchema { SourceProvider = "oracle", DefaultSchema = "SHOP" };
+        s.Tables.Add(new PortableTable(new PortableName("SHOP", "ORDERS"),
+            [
+                new PortableColumn("ID", "NUMBER(10)", false) { Identity = new PortableIdentity(1, 1, false) },
+                new PortableColumn("CUSTOMER_NAME", "VARCHAR2(200)", false),
+                new PortableColumn("STATUS", "VARCHAR2(10)", false) { Default = "'new'" },
+                new PortableColumn("PAID", "NUMBER(1)", false) { Default = "0" },
+                new PortableColumn("QTY", "NUMBER(10)", false) { Default = "1" },
+                new PortableColumn("PRICE", "NUMBER(12,2)", false),
+                new PortableColumn("TOTAL", "NUMBER(14,2)", true) { Computed = "\"PRICE\"*\"QTY\"" },
+                new PortableColumn("CREATED", "DATE", false) { Default = "SYSDATE " },
+                new PortableColumn("UPDATED", "TIMESTAMP(6)", true),
+                new PortableColumn("REF", "RAW(16)", false) { Default = "SYS_GUID()" },
+                new PortableColumn("DOC", "CLOB", true),
+                new PortableColumn("NOTE", "VARCHAR2(100)", true),
+            ],
+            new PortableKey("ORDERS_PK", ["ID"]), [], [new PortableCheck("ORDERS_QTY_CK", "\"QTY\" > 0")], [], []));
+        s.Tables.Add(new PortableTable(new PortableName("SHOP", "CUSTOMERS"),
+            [
+                new PortableColumn("CUSTOMER_ID", "NUMBER(10)", false),
+                new PortableColumn("NAME", "VARCHAR2(100)", false),
+                new PortableColumn("EMAIL", "VARCHAR2(200)", true),
+            ],
+            new PortableKey("CUSTOMERS_PK", ["CUSTOMER_ID"]), [], [], [], []));
+        s.Sequences.Add(new PortableSequence(new PortableName("SHOP", "ORDER_SEQ"), "NUMBER", 1, 1, 1, 9999999999, false));
+        return s;
+    }
+
+    public static ConversionContext ToOracle() => new(Postgres(), new ConversionOptions { TargetProvider = "oracle" });
+
+    public static ConversionContext OracleToPg(NameStyle? names = null) => new(Oracle(), new ConversionOptions { TargetProvider = "postgresql", Names = names });
+
     public static ConversionContext ToMariaDb() => new(Postgres(), new ConversionOptions { TargetProvider = "mariadb" });
 
     public static ConversionContext MariaDbToPg() => new(MariaDb(), new ConversionOptions { TargetProvider = "postgresql" });

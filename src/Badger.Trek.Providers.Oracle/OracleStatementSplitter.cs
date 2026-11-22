@@ -113,7 +113,8 @@ public sealed partial class OracleStatementSplitter : IScriptParser
                 }
             }
 
-            if (empty)
+            // Nothing but comments so far: the statement starts here (unless a comment or literal continues from the line before).
+            if (empty && !scan.InsideText)
             {
                 buffer.Clear();
                 start = n + 1;
@@ -184,11 +185,10 @@ public sealed partial class OracleStatementSplitter : IScriptParser
             for (var i = 0; i < line.Length; i++)
             {
                 var before = i;
-                var inComment = scan.InComment;
                 if (scan.Step(line, ref i))
                 {
                     // Keep strings and quoted names; drop comments.
-                    if (!inComment && !scan.InComment && !scan.LineCommentStarted)
+                    if (!scan.Comment)
                     {
                         sb.Append(line, before, i - before + 1);
                     }
@@ -243,6 +243,9 @@ public sealed partial class OracleStatementSplitter : IScriptParser
 
         public bool InComment { get; private set; }
 
+        /// <summary>What the last <see cref="Step"/> consumed was (part of) a comment, not a literal or quoted name.</summary>
+        public bool Comment { get; private set; }
+
         public bool LineCommentStarted { get; set; }
 
         public bool InsideText => InComment || quote is not null || qClose is not null;
@@ -252,6 +255,7 @@ public sealed partial class OracleStatementSplitter : IScriptParser
         {
             if (InComment)
             {
+                Comment = true;
                 var end = line.IndexOf("*/", i, StringComparison.Ordinal);
                 if (end < 0)
                 {
@@ -266,6 +270,7 @@ public sealed partial class OracleStatementSplitter : IScriptParser
 
             if (qClose is { } close)
             {
+                Comment = false;
                 var end = line.IndexOf(close + "'", i, StringComparison.Ordinal);
                 if (end < 0)
                 {
@@ -280,6 +285,7 @@ public sealed partial class OracleStatementSplitter : IScriptParser
 
             if (quote is { } q)
             {
+                Comment = false;
                 for (; i < line.Length; i++)
                 {
                     if (line[i] != q)
@@ -305,6 +311,7 @@ public sealed partial class OracleStatementSplitter : IScriptParser
             if (c == '-' && i + 1 < line.Length && line[i + 1] == '-')
             {
                 LineCommentStarted = true;
+                Comment = true;
                 i = line.Length - 1;
                 return true;
             }
