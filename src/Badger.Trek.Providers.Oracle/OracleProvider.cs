@@ -48,6 +48,10 @@ public sealed partial class OracleProvider(OracleOptions options) : IDatabasePro
 
     public IEnvironmentResources? Resources => null;
 
+    public ISchemaScripter Scripter { get; } = new Scripting.OracleScripter();
+
+    public IScratchDatabases ScratchDatabases => new Scripting.OracleScratchDatabases(this);
+
     /// <summary>A schema is a user; trek works inside the environment's schema.</summary>
     public string DefaultSchema => string.Empty;
 
