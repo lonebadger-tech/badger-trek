@@ -34,6 +34,9 @@ public static partial class ConversionProject
 
         // MySQL to MariaDB and back: by way of PostgreSQL, so each side's tested mappings apply.
         (Dialect.MySql, Dialect.MySql) when ctx.SourceMariaDb != ctx.TargetMariaDb => new ChainTranslator(ctx),
+        (Dialect.PostgreSql, Dialect.Oracle) => new Oracle.PgToOracleTranslator(ctx),
+        (Dialect.Oracle, Dialect.PostgreSql) => new Oracle.OracleToPgTranslator(ctx),
+        (_, Dialect.Oracle) or (Dialect.Oracle, _) => new ChainTranslator(ctx),
         _ => throw new Core.MigrationException($"Converting {ctx.SourceDisplay} to {ctx.TargetDisplay} is not supported."),
     };
 

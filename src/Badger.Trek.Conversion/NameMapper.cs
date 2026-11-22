@@ -16,13 +16,16 @@ public enum NameStyle
 
     /// <summary>snake_case: CustomerOrder becomes customer_order, HTTPCode becomes http_code.</summary>
     Snake,
+
+    /// <summary>Upper case: unquoted references in existing queries keep working on Oracle, which upper-cases them too.</summary>
+    Upper,
 }
 
 /// <summary>
 /// Maps every identifier from the source to the target. The default schemas map to each other (dbo and public); the
 /// style applies to everything else. All renames are recorded for the conversion report.
 /// </summary>
-public sealed partial class NameMapper(string sourceDefaultSchema, string targetDefaultSchema, NameStyle style)
+public sealed partial class NameMapper(string sourceDefaultSchema, string targetDefaultSchema, NameStyle style, bool foldUpper = false)
 {
     private readonly SortedDictionary<string, string> renamed = new(StringComparer.Ordinal);
 
@@ -37,7 +40,8 @@ public sealed partial class NameMapper(string sourceDefaultSchema, string target
     /// <summary>Any other identifier: table, column, index, constraint, routine, parameter or variable.</summary>
     public string Name(string name)
     {
-        var mapped = Apply(name, style);
+        // Oracle stores unquoted names upper case: every style but Keep ends there (snake_case as CUSTOMER_ORDER).
+        var mapped = foldUpper && style != NameStyle.Keep ? Apply(name, style).ToUpperInvariant() : Apply(name, style);
         if (!string.Equals(mapped, name, StringComparison.Ordinal))
         {
             renamed[name] = mapped;
@@ -50,6 +54,7 @@ public sealed partial class NameMapper(string sourceDefaultSchema, string target
     {
         NameStyle.Lower => name.ToLowerInvariant(),
         NameStyle.Snake => Snake(name),
+        NameStyle.Upper => name.ToUpperInvariant(),
         _ => name,
     };
 
