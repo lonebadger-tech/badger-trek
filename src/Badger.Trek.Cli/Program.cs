@@ -160,7 +160,7 @@ root.Subcommands.Add(log);
 var baselineTo = new Option<string?>("--to") { Description = "Mark changes up to this one as already applied (with --from sqlproj: further than the imported changes)." };
 var baselineFrom = new Option<string?>("--from") { Description = "flyway | dbup | ef | grate | roundhouse | sqitch: read what the database already has from that tool's journal; sqlproj: the database was published from the SQL project (for projects made with 'trek import')." };
 baselineFrom.AcceptOnlyFromAmong("flyway", "dbup", "ef", "grate", "roundhouse", "sqitch", "sqlproj");
-var baselineJournal = new Option<string?>("--journal") { Description = "The tool's journal table, [schema.]table (default: flyway_schema_history, SchemaVersions or __EFMigrationsHistory in dbo/public/main, grate.ScriptsRun, RoundhousE.ScriptsRun, sqitch.changes)." };
+var baselineJournal = new Option<string?>("--journal") { Description = "The tool's journal table, [schema.]table (default: flyway_schema_history, SchemaVersions or __EFMigrationsHistory in dbo/public/main, grate.ScriptsRun, RoundhousE.ScriptsRun, sqitch.changes; on Oracle, in the environment's schema, and CHANGES for Sqitch: pass REGISTRY.CHANGES when Sqitch used another registry)." };
 var baselineSkipChecksums = new Option<bool>("--skip-checksums") { Description = "Do not compare Flyway's checksums, grate's hashes or Sqitch's script hashes with the imported scripts (sqlproj: do not check that the project's tables exist)." };
 var baseline = new Command("baseline", "Adopt an existing database: record changes as applied without running them.") { baselineTo, baselineFrom, baselineJournal, baselineSkipChecksums, yes };
 baseline.SetAction((r, ct) => Commands.Run(Globals(r), g => Commands.Baseline(g, r.GetValue(baselineTo), r.GetValue(baselineFrom), r.GetValue(baselineJournal), r.GetValue(baselineSkipChecksums), r.GetValue(yes), ct)));
@@ -169,7 +169,7 @@ baseline.SetAction((r, ct) => Commands.Run(Globals(r), g => Commands.Baseline(g,
 var import = new Command("import", "Convert another tool's migrations (Flyway, DbUp, Entity Framework Core, grate, Sqitch, SQL projects) into a new trek project (written to --project).") { noAgentsFile };
 var importPath = new Argument<string>("path") { Description = "The folder to import from." };
 var importDryRun = new Option<bool>("--dry-run") { Description = "Show what would be written without writing anything." };
-var importProvider = new Option<string?>("--provider") { Description = "The database the project targets: sqlserver (default), postgresql, mysql, mariadb, oracle or sqlite. Sqitch projects for pg or sqlite default to that provider." };
+var importProvider = new Option<string?>("--provider") { Description = "The database the project targets: sqlserver (default), postgresql, mysql, mariadb, oracle or sqlite. Sqitch projects for pg, oracle or sqlite default to that provider." };
 var flywayConfig = new Option<string?>("--config") { Description = "flyway.conf or flyway.toml (default: found in the folder or its conf/ folder)." };
 var flywayLocation = new Option<string[]>("--location") { Description = "Migration folder; overrides flyway.locations. Repeatable." };
 var importFlyway = new Command("flyway", "Import a Flyway project: V/U/R scripts, placeholders, script config and environments.") { importPath, flywayConfig, flywayLocation, importProvider, importDryRun };
@@ -206,9 +206,9 @@ import.Subcommands.Add(importSqlProj);
 root.Subcommands.Add(import);
 
 // convert
-var convert = new Command("convert", "Convert a live database between SQL Server, PostgreSQL, MySQL, MariaDB and SQLite: its schema into a new trek project for the provider you choose (convert schema --to), then its rows (convert data).") { noAgentsFile };
+var convert = new Command("convert", "Convert a live database between SQL Server, PostgreSQL, MySQL, MariaDB, Oracle and SQLite: its schema into a new trek project for the provider you choose (convert schema --to), then its rows (convert data).") { noAgentsFile };
 var convertOut = new Option<string>("--out", "-o") { Description = "Folder for the new project (must not contain one yet).", Required = true };
-var convertTo = new Option<string>("--to") { Description = "Target provider: sqlserver, postgresql, mysql, mariadb or sqlite.", Required = true };
+var convertTo = new Option<string>("--to") { Description = "Target provider: sqlserver, postgresql, mysql, mariadb, oracle or sqlite.", Required = true };
 var convertFrom = new Option<string?>("--from-provider") { Description = "The source provider when the source is a --connection-string rather than an environment of the project in --project." };
 var convertNames = new Option<string?>("--names") { Description = "Identifiers in the target: lower (default for PostgreSQL), upper (default for Oracle), snake (CustomerOrder -> customer_order; CUSTOMER_ORDER on Oracle) or keep (default for SQL Server, MySQL, MariaDB and SQLite)." };
 convertNames.AcceptOnlyFromAmong("keep", "lower", "snake");

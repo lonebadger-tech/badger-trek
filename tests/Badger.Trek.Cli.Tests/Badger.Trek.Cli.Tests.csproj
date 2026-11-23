@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <Compile Include="..\Badger.Trek.Providers.SqlServer.Tests\SqlProjSample.cs" Link="SqlProjSample.cs" />
+    <None Include="..\Badger.Trek.Core.Tests\EfScripts\oracle\*.sql" LinkBase="EfScripts\oracle" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

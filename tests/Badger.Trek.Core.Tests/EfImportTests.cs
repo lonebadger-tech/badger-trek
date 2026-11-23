@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Badger.Trek.Core.Import;
 using Badger.Trek.Core.Plan;
 using Badger.Trek.Core.Project;
@@ -6,7 +7,7 @@ namespace Badger.Trek.Core.Tests;
 
 /// <summary>
 /// Entity Framework Core 10 migrations, imported from the scripts 'dotnet ef migrations script' wrote for SQL Server,
-/// PostgreSQL and SQLite (EfScripts/): three migrations, Initial, AddBlogUrl and RatingDropTitle.
+/// PostgreSQL, SQLite and Oracle (Oracle.EntityFrameworkCore 10.23) (EfScripts/): three migrations, Initial, AddBlogUrl and RatingDropTitle.
 /// </summary>
 public sealed class EfImportTests : IDisposable
 {
@@ -28,6 +29,7 @@ public sealed class EfImportTests : IDisposable
     [InlineData("sqlserver")]
     [InlineData("postgresql")]
     [InlineData("sqlite")]
+    [InlineData("oracle")]
     public void Each_migration_becomes_a_change_with_its_down_as_revert(string provider)
     {
         Assert.Equal(provider, EfImporter.DetectProvider(Script(provider, "up")));
@@ -87,6 +89,45 @@ public sealed class EfImportTests : IDisposable
             BEGIN
                 CREATE TABLE [Blogs] ([Id] int NOT NULL IDENTITY);
             END;
+            """;
+
+        var ex = Assert.Throws<MigrationException>(() => EfImporter.Import(new EfImportOptions { UpScript = idempotent }));
+        Assert.Contains("--idempotent", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Oracle_statements_keep_their_slash_lines()
+    {
+        var imported = Import("oracle");
+
+        Assert.All(imported.Changes, c =>
+        {
+            foreach (var sql in new[] { c.Deploy, c.Revert! })
+            {
+                // Each statement still ends with its own '/' line, which the Oracle provider splits on.
+                Assert.Matches(@"\n/\n$", sql);
+                Assert.DoesNotMatch(@"\A\s*/", sql);
+                Assert.DoesNotContain("USER_TABLES", sql, StringComparison.Ordinal);
+            }
+        });
+        Assert.StartsWith("BEGIN\nEXECUTE IMMEDIATE 'CREATE TABLE", imported.Changes[0].Deploy, StringComparison.Ordinal);
+        Assert.Equal(3, Regex.Count(imported.Changes[0].Deploy, @"(?m)^/$"));
+        Assert.Equal(2, Regex.Count(imported.Changes[2].Revert!, @"(?m)^/$"));
+    }
+
+    [Fact]
+    public void An_idempotent_oracle_script_is_refused()
+    {
+        var idempotent = """
+            DECLARE
+                v_Count INTEGER;
+            BEGIN
+            SELECT COUNT(*) INTO v_Count FROM "__EFMigrationsHistory" WHERE "MigrationId" = N'20261123183027_Initial';
+            IF v_Count = 0 THEN
+                EXECUTE IMMEDIATE 'CREATE TABLE "Blogs" ("Id" NUMBER(10))';
+            END IF;
+            END;
+            /
             """;
 
         var ex = Assert.Throws<MigrationException>(() => EfImporter.Import(new EfImportOptions { UpScript = idempotent }));

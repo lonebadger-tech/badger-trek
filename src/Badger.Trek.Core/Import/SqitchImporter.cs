@@ -20,7 +20,8 @@ public sealed record SqitchImportOptions
 /// A reworked change (the same name later in the plan) becomes &lt;name&gt;-v2, -v3, ..., with the earlier
 /// versions' scripts taken from &lt;name&gt;@&lt;tag&gt;.sql as Sqitch keeps them. Notes start with
 /// "sqitch &lt;name&gt;" so each change can be traced back. Sqitch has no SQL Server engine, so scripts are
-/// copied as written and usually need translating to T-SQL.
+/// copied as written and usually need translating to T-SQL. Scripts for Sqitch's Oracle engine are SQL*Plus scripts,
+/// which trek's Oracle provider reads the same way (PL/SQL blocks end with a '/' line).
 /// </summary>
 public static partial class SqitchImporter
 {
@@ -50,7 +51,8 @@ public static partial class SqitchImporter
         var verifyDir = System.IO.Path.Combine(root, Setting("verify_dir", System.IO.Path.Combine(Setting("top_dir", "."), "verify")));
         var extension = Setting("extension", "sql");
 
-        var result = new ImportedProject { Tool = Tool, CanBaselineFromJournal = IsPostgres(engine), SourceEngine = engine };
+        var oracle = IsOracle(engine);
+        var result = new ImportedProject { Tool = Tool, CanBaselineFromJournal = IsPostgres(engine) || oracle, SourceEngine = engine };
         var plan = ParsePlan(File.ReadAllText(planPath, Encoding.UTF8), planPath);
         if (plan.Entries.All(e => e.Tag is not null))
         {
@@ -152,7 +154,8 @@ public static partial class SqitchImporter
             var revertPath = System.IO.Path.Combine(revertDir, file);
             var verifyPath = System.IO.Path.Combine(verifyDir, file);
             var revert = File.Exists(revertPath) ? Read(revertPath, result) : null;
-            var flags = (revert is null ? ChangeFlags.Irreversible : ChangeFlags.None) | (OwnsTransaction(deploy) ? ChangeFlags.NoTransaction : ChangeFlags.None);
+            // On Oracle a BEGIN line starts a PL/SQL block, not a transaction (and trek runs Oracle changes without one).
+            var flags = (revert is null ? ChangeFlags.Irreversible : ChangeFlags.None) | (!oracle && OwnsTransaction(deploy) ? ChangeFlags.NoTransaction : ChangeFlags.None);
             var tags = new List<string>();
             var index = plan.Entries.ToList().IndexOf(entry);
             for (var j = index + 1; j < plan.Entries.Count && plan.Entries[j].Tag is { } tag; j++)
@@ -189,10 +192,14 @@ public static partial class SqitchImporter
 
         result.Warnings.Add(IsPostgres(engine)
             ? "the scripts were copied as written for PostgreSQL; databases Sqitch deployed can be adopted with 'trek baseline --from sqitch'."
+            : oracle
+            ? $"the scripts were copied as written for Oracle; databases Sqitch deployed can be adopted with 'trek baseline --from sqitch'{(Get(config, "engine.oracle.registry") is { } registry ? $" --journal {registry}.CHANGES" : string.Empty)}."
             : $"the scripts were copied as written{(engine is null ? string.Empty : $" for {engine}")}; run them with the provider for that database, or translate them. 'trek plan check' flags what does not parse.");
         if (config.Keys.Any(k => k.Contains("variables", StringComparison.OrdinalIgnoreCase)))
         {
-            result.Warnings.Add("sqitch.conf defines variables, which Sqitch hands to the database client; scripts that use them need {name} variables in trek.yaml instead.");
+            result.Warnings.Add(oracle
+                ? "sqitch.conf defines variables, which Sqitch hands to SQL*Plus as &name substitutions; trek does not substitute &name, so scripts that use them need {name} variables in trek.yaml instead."
+                : "sqitch.conf defines variables, which Sqitch hands to the database client; scripts that use them need {name} variables in trek.yaml instead.");
         }
 
         return result;
@@ -200,6 +207,9 @@ public static partial class SqitchImporter
 
     /// <summary>Sqitch engines trek's PostgreSQL provider runs (CockroachDB speaks the protocol but lacks advisory locks and pg_catalog parity).</summary>
     public static bool IsPostgres(string? engine) => engine is "pg" or "postgres" or "postgresql";
+
+    /// <summary>Sqitch's Oracle engine, whose registry (CHANGES ...) is in the login's schema unless engine.oracle.registry names another.</summary>
+    public static bool IsOracle(string? engine) => engine is "oracle";
 
     /// <summary>Sqitch's SQLite engine (its registry is a separate file, so there is no journal to baseline from).</summary>
     public static bool IsSqlite(string? engine) => engine is "sqlite" or "sqlite3";

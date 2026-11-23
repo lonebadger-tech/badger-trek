@@ -221,7 +221,30 @@ public sealed class GrateSqitchImportTests : IDisposable
         Assert.Equal("-- verify users", project.Changes[3].VerifyScript);
     }
 
-    private static string Sha1(string text) => Convert.ToHexStringLower(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+    [Fact]
+    public void Sqitch_oracle_project_keeps_plsql_blocks_and_can_baseline()
+    {
+        Write("sqitch.conf", "[core]\n\tengine = oracle\n[engine \"oracle\"]\n\tregistry = SQITCH_REG\n[core \"variables\"]\n\tapp = flipr\n");
+        Write("sqitch.plan", "%project=flipr\nusers 2026-11-03T20:56:05Z A <a@b>\n");
+        Write("deploy/users.sql", "-- Deploy flipr:users to oracle\n\nCREATE TABLE users (nick VARCHAR2(512 CHAR) PRIMARY KEY);\n\nBEGIN\n  INSERT INTO users VALUES ('admin');\nEND;\n/\n\nCOMMIT;\n");
+        Write("revert/users.sql", "DROP TABLE users;\n");
+
+        var imported = SqitchImporter.Import(new SqitchImportOptions { Path = dir });
+
+        // BEGIN starts a PL/SQL block on Oracle, not a transaction: the change is not !notx.
+        Assert.Equal(ChangeFlags.None, imported.Changes[0].Flags);
+        Assert.Contains("END;\n/\n", imported.Changes[0].Deploy, StringComparison.Ordinal);
+        Assert.True(imported.CanBaselineFromJournal);
+        Assert.Equal("oracle", imported.SourceEngine);
+        Assert.True(SqitchImporter.IsOracle(imported.SourceEngine));
+        var warnings = string.Join("\n", imported.Warnings);
+        Assert.Contains("copied as written for Oracle", warnings, StringComparison.Ordinal);
+        Assert.Contains("--journal SQITCH_REG.CHANGES", warnings, StringComparison.Ordinal);
+        Assert.Contains("&name", warnings, StringComparison.Ordinal);
+        Assert.DoesNotContain("!notx", warnings, StringComparison.Ordinal);
+    }
+
+    private static string Sha1(string text) =>Convert.ToHexStringLower(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
 
     [Fact]
     public void Sqitch_target_follows_the_registry_with_reworks_and_checks_hashes()
