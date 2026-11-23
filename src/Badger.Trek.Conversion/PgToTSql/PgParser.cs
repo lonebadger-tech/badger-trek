@@ -26,19 +26,30 @@ internal sealed class PgParser
     /// <param name="mode">
     /// SQLite: see the other constructor. MySQL: `name` identifiers, backslash escapes, # comments, &lt;=&gt;, || and &amp;&amp;
     /// as OR and AND, !, DIV, MOD, ^ (XOR), REGEXP / RLIKE, x'..' and b'..', INTERVAL n UNIT, LIMIT offset, count,
-    /// CONVERT(), GROUP_CONCAT(... SEPARATOR ...) and CREATE ... VIEW as SHOW CREATE VIEW writes it.
+    /// CONVERT(), GROUP_CONCAT(... SEPARATOR ...) and CREATE ... VIEW as SHOW CREATE VIEW writes it. Oracle: unquoted
+    /// names upper-cased (as Oracle stores them), q'[..]' strings, MINUS, the (+) outer-join marker, INTERVAL '1' DAY,
+    /// VARCHAR2(n CHAR), RETURNING in JSON functions and CREATE ... VIEW as Oracle writes it.
     /// </param>
     public PgParser(string text, ParseMode mode)
     {
         this.text = text;
         sqlite = mode == ParseMode.Sqlite;
         mysql = mode == ParseMode.MySql;
+        oracle = mode == ParseMode.Oracle;
         tokens = PgLexer.Tokenize(text, mode);
     }
 
     private readonly bool sqlite;
 
     private readonly bool mysql;
+
+    private readonly bool oracle;
+
+    /// <summary>The name of the call that marks an Oracle (+) outer-join column: PgCall("(+)", [column]).</summary>
+    public const string OuterJoinMarker = "(+)";
+
+    /// <summary>Words that end a FROM item in Oracle, so they are not read as a table alias.</summary>
+    private static readonly HashSet<string> OracleReserved = new(StringComparer.Ordinal) { "minus", "connect", "start", "model", "pivot", "unpivot", "sample" };
 
     private static readonly HashSet<string> Reserved = new(StringComparer.Ordinal)
     {
@@ -126,13 +137,15 @@ internal sealed class PgParser
         if (t.Kind == TokenKind.Word)
         {
             pos++;
-            return t.Value;
+
+            // Oracle stores an unquoted name upper case: "EMP" and emp are the same table.
+            return oracle ? t.Text.ToUpperInvariant() : t.Value;
         }
 
         throw Error("expected a name");
     }
 
-    private bool IsIdentifierStart => Peek().Kind == TokenKind.QuotedIdent || (Peek().Kind == TokenKind.Word && !Reserved.Contains(Peek().Value));
+    private bool IsIdentifierStart => Peek().Kind == TokenKind.QuotedIdent || (Peek().Kind == TokenKind.Word && !Reserved.Contains(Peek().Value) && !(oracle && OracleReserved.Contains(Peek().Value)));
 
     private PgName QualifiedName()
     {
@@ -1048,9 +1061,9 @@ internal sealed class PgParser
     private PgQueryBody SetExpression()
     {
         var left = SetTerm();
-        while (IsWord("union") || IsWord("except") || IsWord("intersect"))
+        while (IsWord("union") || IsWord("except") || IsWord("intersect") || (oracle && IsWord("minus")))
         {
-            var op = Next().Value;
+            var op = Next().Value is "minus" ? "except" : Peek(-1).Value;
             var all = AcceptWord("all");
             AcceptWord("distinct");
             var right = SetTerm();
@@ -1127,6 +1140,11 @@ internal sealed class PgParser
 
         var from = AcceptWord("from") ? FromList() : [];
         var where = AcceptWord("where") ? Expr() : null;
+        if (oracle && (IsWord("connect") || (IsWord("start") && IsWord("with", 1))))
+        {
+            throw Error("a hierarchical query (CONNECT BY) has no PostgreSQL counterpart; rewrite it with WITH RECURSIVE");
+        }
+
         var group = new List<PgExpr>();
         if (AcceptWords("group", "by"))
         {
@@ -1409,6 +1427,14 @@ internal sealed class PgParser
                     }
 
                     var what = Next().Value;
+                    if (oracle && what == "json")
+                    {
+                        // Oracle: doc IS [NOT] JSON [STRICT | LAX].
+                        _ = AcceptWord("strict") || AcceptWord("lax");
+                        e = new PgIs(e, what, not);
+                        continue;
+                    }
+
                     if (what is not ("null" or "true" or "false" or "unknown"))
                     {
                         throw Error($"IS {what.ToUpperInvariant()}");
@@ -1669,6 +1695,12 @@ internal sealed class PgParser
             parts.Add(first.Text);
             pos++;
         }
+        else if (oracle && first.Kind == TokenKind.Word)
+        {
+            // Oracle type names are read in lower case, like PostgreSQL's.
+            parts.Add(first.Value);
+            pos++;
+        }
         else
         {
             parts.Add(Identifier());
@@ -1704,11 +1736,19 @@ internal sealed class PgParser
             do
             {
                 args.Add(Next().Text);
+
+                // Oracle: VARCHAR2(20 CHAR), RAW(16 BYTE).
+                _ = oracle && (AcceptWord("char") || AcceptWord("byte"));
             }
             while (AcceptPunct(","));
 
             ExpectPunct(")");
             type += "(" + string.Join(",", args) + ")";
+        }
+
+        if (oracle && AcceptWords("with", "local", "time", "zone"))
+        {
+            return type + " with time zone";
         }
 
         if (mysql && (AcceptWord("charset") || AcceptWords("character", "set")))
@@ -1810,6 +1850,8 @@ internal sealed class PgParser
                 return Case();
             case "interval" when mysql && MySqlInterval() is { } interval:
                 return interval;
+            case "interval" when oracle && Peek(1).Kind == TokenKind.String:
+                return OracleInterval();
             case "convert" when mysql && IsPunct("(", 1):
             {
                 // MySQL: CONVERT(x, type) is a cast; CONVERT(x USING charset) only changes the character set.
@@ -2046,6 +2088,13 @@ internal sealed class PgParser
         }
 
         var name = new PgName(parts);
+        if (oracle && IsPunct("(") && IsPunct("+", 1) && IsPunct(")", 2))
+        {
+            // Oracle's outer-join marker: a.id = b.a_id(+).
+            pos += 3;
+            return new PgCall(new PgName([OuterJoinMarker]), [name]);
+        }
+
         return IsPunct("(") ? CallAfterName(name) : name;
     }
 
@@ -2092,6 +2141,21 @@ internal sealed class PgParser
                 // MySQL: GROUP_CONCAT(x ORDER BY y SEPARATOR ', '); kept as a last, named argument.
                 names.Add("separator");
                 args.Add(Expr());
+            }
+
+            if (oracle && AcceptWord("returning"))
+            {
+                // Oracle: JSON_VALUE(doc, '$.a' RETURNING NUMBER); the type is kept as a last, named argument.
+                names.Add("returning");
+                args.Add(new PgLiteral(LiteralKind.String, TypeName()));
+            }
+
+            // Oracle: ON ERROR / ON EMPTY / WITH WRAPPER / ON OVERFLOW clauses are not carried over.
+            var depth = 0;
+            while (oracle && !AtEnd && !(depth == 0 && IsPunct(")")))
+            {
+                var tk = Next();
+                depth += tk.IsPunct("(") ? 1 : tk.IsPunct(")") ? -1 : 0;
             }
         }
 
@@ -2284,6 +2348,146 @@ internal sealed class PgParser
         return new MySqlViewDef(name, columns, query, check);
     }
 
+    // ------------------------------------------------------------------ Oracle
+
+    /// <summary>
+    /// An Oracle view: CREATE [OR REPLACE] [[NO] FORCE] [EDITIONABLE | NONEDITIONABLE | EDITIONING] VIEW name [(columns)]
+    /// [DEFAULT COLLATION c] [BEQUEATH ...] AS query [WITH READ ONLY | WITH CHECK OPTION] [CONSTRAINT c], or only the query
+    /// (ALL_VIEWS.TEXT).
+    /// </summary>
+    public OracleViewDef OracleView()
+    {
+        string? name = null;
+        var columns = new List<string>();
+        if (AcceptWord("create"))
+        {
+            AcceptWords("or", "replace");
+            var modifier = true;
+            while (modifier)
+            {
+                modifier = AcceptWord("no") || AcceptWord("force") || AcceptWord("noforce") || AcceptWord("editionable") || AcceptWord("noneditionable") || AcceptWord("editioning");
+            }
+
+            ExpectWord("view");
+            name = QualifiedName().Last;
+            if (IsPunct("("))
+            {
+                // Column names, possibly with inline constraints: only the names are kept.
+                pos++;
+                var depth = 0;
+                var expectName = true;
+                while (!AtEnd && !(depth == 0 && IsPunct(")")))
+                {
+                    var tk = Next();
+                    if (depth == 0 && expectName && tk.Kind is TokenKind.Word or TokenKind.QuotedIdent)
+                    {
+                        columns.Add(tk.Kind == TokenKind.QuotedIdent ? tk.Value : tk.Text.ToUpperInvariant());
+                    }
+
+                    depth += tk.IsPunct("(") ? 1 : tk.IsPunct(")") ? -1 : 0;
+                    expectName = depth == 0 && tk.IsPunct(",");
+                }
+
+                ExpectPunct(")");
+            }
+
+            while (!AtEnd && !IsWord("as"))
+            {
+                Next();
+            }
+
+            ExpectWord("as");
+        }
+
+        var query = Query();
+        var check = false;
+        var readOnly = false;
+        if (AcceptWord("with"))
+        {
+            if (AcceptWords("read", "only"))
+            {
+                readOnly = true;
+            }
+            else
+            {
+                ExpectWords("check", "option");
+                check = true;
+            }
+
+            if (AcceptWord("constraint"))
+            {
+                Identifier();
+            }
+        }
+
+        AcceptPunct(";");
+        AcceptPunct("/");
+        if (!AtEnd)
+        {
+            throw Error("unexpected text after the view");
+        }
+
+        return new OracleViewDef(name, columns, query, check, readOnly);
+    }
+
+    private static readonly HashSet<string> OracleIntervalUnits = new(StringComparer.Ordinal) { "year", "month", "day", "hour", "minute", "second" };
+
+    /// <summary>Oracle's INTERVAL 'value' unit [(p)] [TO unit [(p)]] as a PostgreSQL interval literal.</summary>
+    private PgExpr OracleInterval()
+    {
+        pos++;
+        var value = Next().Value.Trim();
+        var from = Next().Value;
+        if (!OracleIntervalUnits.Contains(from))
+        {
+            throw Error("INTERVAL unit");
+        }
+
+        SkipPrecision();
+        string? to = null;
+        if (AcceptWord("to"))
+        {
+            to = Next().Value;
+            SkipPrecision();
+        }
+
+        var negative = value.StartsWith('-');
+        var body = value.TrimStart('-', '+');
+        var sign = negative ? "-" : string.Empty;
+        string text;
+        if (to is null)
+        {
+            text = $"{sign}{body} {from}";
+        }
+        else if (from == "year")
+        {
+            var ym = body.Split('-');
+            text = $"{sign}{ym[0]} years" + (ym.Length > 1 ? $" {sign}{ym[1]} months" : string.Empty);
+        }
+        else if (from == "day")
+        {
+            var space = body.IndexOf(' ', StringComparison.Ordinal);
+            var days = space < 0 ? body : body[..space];
+            var rest = space < 0 ? string.Empty : body[(space + 1)..];
+            text = $"{sign}{days} days" + (rest.Length == 0 ? string.Empty : to == "hour" ? $" {sign}{rest} hours" : $" {sign}{rest}");
+        }
+        else
+        {
+            // HOUR TO MINUTE '2:30', HOUR TO SECOND '2:30:15', MINUTE TO SECOND '30:15'.
+            text = sign + (from == "minute" ? "00:" + body : body);
+        }
+
+        return new PgTypedLiteral("interval", text);
+    }
+
+    private void SkipPrecision()
+    {
+        if (IsPunct("(") && IsPunct(")", 2))
+        {
+            pos += 3;
+        }
+    }
+
     /// <summary>MySQL interval units and the PostgreSQL units of their parts (DAY_HOUR '1 2' is 1 day 2 hours).</summary>
     private static readonly Dictionary<string, string[]> MySqlIntervalUnits = new(StringComparer.Ordinal)
     {
@@ -2474,6 +2678,9 @@ internal sealed class PgParser
 /// <summary>A SQLite CREATE TRIGGER: one event, row level, a body of SQL statements.</summary>
 /// <param name="CheckOption">CASCADED or LOCAL when the view has WITH CHECK OPTION, else null.</param>
 internal sealed record MySqlViewDef(string Name, IReadOnlyList<string> Columns, PgQuery Query, string? CheckOption);
+
+/// <param name="Name">Null when the text was only the query.</param>
+internal sealed record OracleViewDef(string? Name, IReadOnlyList<string> Columns, PgQuery Query, bool CheckOption, bool ReadOnly);
 
 internal sealed record SqliteTriggerDef(string Name, string Timing, string Event, IReadOnlyList<string> Columns, PgName Table, PgExpr? When, IReadOnlyList<PgStatement> Body);
 

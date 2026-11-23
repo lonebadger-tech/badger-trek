@@ -6,11 +6,11 @@ using Badger.Trek.Conversion.PgToTSql;
 namespace Badger.Trek.Conversion.Sqlite;
 
 /// <summary>
-/// Writes <see cref="PgParser"/>'s syntax tree back out as SQL: as SQLite or MySQL when the source is PostgreSQL, as
-/// PostgreSQL when the source is SQLite or MySQL. SQLite and PostgreSQL share most syntax (|| concatenation,
+/// Writes <see cref="PgParser"/>'s syntax tree back out as SQL: as SQLite, MySQL or Oracle when the source is PostgreSQL,
+/// as PostgreSQL when the source is SQLite, MySQL or Oracle. SQLite and PostgreSQL share most syntax (|| concatenation,
 /// LIMIT/OFFSET, boolean expressions, RETURNING, UPDATE ... FROM), so the work is in functions, dates, casts and the
-/// few operators one side lacks; MySQL's differences live in SqlPrinter.MySql.cs. Untranslatable fragments become
-/// REVIEW comments.
+/// few operators one side lacks; MySQL's differences live in SqlPrinter.MySql.cs, Oracle's in SqlPrinter.Oracle.cs.
+/// Untranslatable fragments become REVIEW comments.
 /// </summary>
 internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> issues)
 {
@@ -31,8 +31,14 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
     /// <summary>"MySQL" or "MariaDB", for messages about the source.</summary>
     private string MySrc => ctx.SourceDisplay;
 
-    /// <summary>Writing PostgreSQL (from SQLite or MySQL).</summary>
+    /// <summary>Writing PostgreSQL (from SQLite, MySQL or Oracle).</summary>
     private readonly bool toPg = ctx.Target == Dialect.PostgreSql;
+
+    /// <summary>Writing Oracle (from PostgreSQL).</summary>
+    private readonly bool toOracle = ctx.Target == Dialect.Oracle;
+
+    /// <summary>Writing PostgreSQL from Oracle.</summary>
+    private readonly bool fromOracle = ctx.Source == Dialect.Oracle && ctx.Target == Dialect.PostgreSql;
 
     /// <summary>Table names replaced while printing a trigger body (transition tables → a row of NEW/OLD).</summary>
     public Dictionary<string, string> TableReplacements { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -95,6 +101,22 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     private string Lit(string text) => toMySql ? ConversionContext.MySqlLiteral(text) : "'" + text.Replace("'", "''", StringComparison.Ordinal) + "'";
 
+    /// <summary>A string literal of the source, with Oracle's empty string (which is NULL) flagged.</summary>
+    private string StringLiteral(string text)
+    {
+        if (text.Length == 0 && toOracle)
+        {
+            return "''" + Note("Oracle stores '' as NULL: a NOT NULL column rejects it and = '' never matches");
+        }
+
+        if (text.Length == 0 && fromOracle)
+        {
+            return "NULL" + Note("'' is NULL in Oracle and was written as NULL");
+        }
+
+        return Lit(text);
+    }
+
     internal static string? StringArg(PgExpr e) => e switch
     {
         PgLiteral { Kind: LiteralKind.String } s => s.Value,
@@ -105,6 +127,12 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     private static PgExpr Unparen(PgExpr e) => e is PgCall { Function.Parts: ["("] } p ? Unparen(p.Args[0]) : e;
 
+    /// <summary>Derived tables given an alias so far (Oracle's need none).</summary>
+    private int derivedTables;
+
+    /// <summary>The CTE names of the queries being printed, which FROM names as they are.</summary>
+    private readonly HashSet<string> cteNames = new(StringComparer.Ordinal);
+
     // ------------------------------------------------------------------ names
 
     public string Table(PgName name)
@@ -114,9 +142,15 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             return replacement;
         }
 
-        // MySQL views name their tables without the database: in PostgreSQL they live in the mapped default schema.
+        // A CTE of an enclosing query is not a table: never qualified.
+        if (name.Parts.Count == 1 && cteNames.Contains(name.Last))
+        {
+            return ctx.Ident(name.Last);
+        }
+
+        // MySQL and Oracle views name their tables without the database or schema: in PostgreSQL they live in the mapped default schema.
         return name.Parts.Count >= 2 ? ctx.Qualified(new Core.Conversion.PortableName(name.Parts[^2], name.Last))
-            : fromMySql ? ctx.Qualified(new Core.Conversion.PortableName(ctx.Schema.DefaultSchema, name.Last))
+            : fromMySql || fromOracle ? ctx.Qualified(new Core.Conversion.PortableName(ctx.Schema.DefaultSchema, name.Last))
             : ctx.Quote(ctx.TargetName(ctx.Schema.DefaultSchema, name.Last).Name);
     }
 
@@ -153,30 +187,42 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     // ------------------------------------------------------------------ expressions
 
-    public string Expr(PgExpr e)
+    /// <summary>An expression where a value is expected. Oracle (19c) has no boolean values: a condition becomes CASE WHEN ... THEN 1.</summary>
+    public string Expr(PgExpr e) => toOracle && IsCondition(e) ? BooleanValue(e) : ExprCore(e);
+
+    /// <summary>An expression where a condition is expected (WHERE, ON, HAVING, CASE WHEN, AND / OR / NOT operands, CHECK).</summary>
+    public string Cond(PgExpr e) => toOracle ? OracleCondition(e) : Expr(e);
+
+    private string ExprCore(PgExpr e)
     {
         switch (e)
         {
             case PgLiteral l:
                 return l.Kind switch
                 {
-                    LiteralKind.String => Lit(l.Value),
+                    LiteralKind.String => StringLiteral(l.Value),
                     LiteralKind.Null => "NULL",
-                    LiteralKind.True => toMySql ? "TRUE" : "true",
-                    LiteralKind.False => toMySql ? "FALSE" : "false",
+                    LiteralKind.True => toMySql ? "TRUE" : toOracle ? "1" : "true",
+                    LiteralKind.False => toMySql ? "FALSE" : toOracle ? "0" : "false",
                     LiteralKind.Default => "DEFAULT",
                     _ => l.Value,
                 };
+            case PgName n when fromOracle && OracleName(n) is { } special:
+                return special;
             case PgName n:
                 return Name(n);
             case PgStar s:
                 return s.Qualifier is null ? "*" : Name(s.Qualifier) + ".*";
             case PgParam p:
                 return NameReplacements.TryGetValue("$" + p.Index, out var arg) ? arg : toSqlite ? $"?{p.Index}" : $"${p.Index}";
+            case PgCall { Function.Parts: [PgParser.OuterJoinMarker] } marker:
+                return Unsupported("an Oracle (+) outer join that could not be rewritten as a LEFT JOIN", Show(marker.Args[0]) + "(+)", Expr(marker.Args[0]));
             case PgCall c:
                 return Call(c);
             case PgBinary b:
                 return Binary(b);
+            case PgUnary { Op: "not" } u when toOracle:
+                return u.Operand is PgCall { Function.Parts: ["("] } ? "NOT " + Cond(u.Operand) : $"NOT ({Cond(u.Operand)})";
             case PgUnary u:
                 return u.Op == "not" ? "NOT " + Expr(u.Operand) : u.Op + Expr(u.Operand);
             case PgCast c:
@@ -185,10 +231,17 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                 return TypedLiteral(t);
             case PgCase c:
                 return "CASE " + (c.Input is null ? string.Empty : Expr(c.Input) + " ")
-                    + string.Concat(c.Whens.Select(w => $"WHEN {Expr(w.When)} THEN {Expr(w.Then)} "))
+                    + string.Concat(c.Whens.Select(w => $"WHEN {(c.Input is null ? Cond(w.When) : Expr(w.When))} THEN {Expr(w.Then)} "))
                     + (c.Else is null ? string.Empty : $"ELSE {Expr(c.Else)} ") + "END";
+            case PgIs i when toOracle && i.What is not "null":
+                return IsTruthToOracle(i);
+            case PgIs { What: "json" } i:
+                return $"{Expr(i.Operand)} IS {(i.Not ? "NOT " : string.Empty)}JSON" + Note("IS JSON needs PostgreSQL 16; a jsonb column needs no such check");
             case PgIs i:
                 return $"{Expr(i.Operand)} IS {(i.Not ? "NOT " : string.Empty)}{i.What.ToUpperInvariant()}";
+            case PgIsDistinct d when toOracle:
+                // DECODE matches NULL with NULL.
+                return $"DECODE({Expr(d.Left)}, {Expr(d.Right)}, {(d.Not ? "1, 0" : "0, 1")}) = 1";
             case PgIsDistinct d when toMySql:
                 return d.Not ? $"{Expr(d.Left)} <=> {Expr(d.Right)}" : $"NOT ({Expr(d.Left)} <=> {Expr(d.Right)})";
             case PgIsDistinct d:
@@ -211,6 +264,8 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                 return Quantified(q);
             case PgArray a when toPg:
                 return $"ARRAY[{string.Join(", ", a.Elements.Select(Expr))}]";
+            case PgArray a when toOracle:
+                return Unsupported("Oracle has no arrays in SQL", $"ARRAY[{string.Join(", ", a.Elements.Select(Show))}]");
             case PgArray a when toMySql:
                 return $"JSON_ARRAY({string.Join(", ", a.Elements.Select(Expr))})" + Note("an array became a JSON array (JSON_ARRAY)");
             case PgArray a:
@@ -224,12 +279,15 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             case PgExtract x:
                 return toSqlite ? Strftime(x.Field, Expr(x.Source))
                     : toMySql ? MySqlExtract(x.Field, Expr(x.Source))
+                    : toOracle ? OracleExtract(x.Field, x.Source)
                     : fromMySql ? ExtractFromMySql(x.Field, x.Source)
                     : $"EXTRACT({x.Field} FROM {Expr(x.Source)})";
             case PgAtTimeZone z when toPg:
                 return $"({Expr(z.Operand)} AT TIME ZONE {Expr(z.Zone)})";
             case PgAtTimeZone z when toMySql:
                 return AtTimeZoneToMySql(z);
+            case PgAtTimeZone z when toOracle:
+                return AtTimeZoneToOracle(z);
             case PgAtTimeZone z when StringArg(z.Zone)?.Equals("utc", StringComparison.OrdinalIgnoreCase) == true:
                 // SQLite keeps times as UTC text already.
                 return Unparen(z.Operand) is PgCall { Function.Last: "now" or "current_timestamp" or "transaction_timestamp" or "statement_timestamp" or "clock_timestamp" }
@@ -241,7 +299,7 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                     return $"{Expr(c.Operand)} COLLATE {c.Collation.Trim('"').ToUpperInvariant()}";
                 }
 
-                if (toMySql)
+                if (toMySql || toOracle)
                 {
                     return Expr(c.Operand) + Note($"COLLATE {c.Collation} was dropped (PostgreSQL collations have no {My} counterpart)");
                 }
@@ -252,6 +310,8 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                 }
 
                 return Expr(c.Operand);
+            case PgRawExpr r:
+                return r.Text;
             default:
                 return Unsupported("expression not translated", Show(e));
         }
@@ -259,9 +319,9 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     private string Quantified(PgQuantified q)
     {
-        if (toPg || (toMySql && q.Query is not null))
+        if (toPg || ((toMySql || toOracle) && q.Query is not null))
         {
-            // MySQL has op ANY / ALL (subquery), but no arrays.
+            // MySQL and Oracle have op ANY / ALL (subquery), but no arrays.
             return $"{Expr(q.Left)} {q.Op} {q.Quantifier.ToUpperInvariant()} ({(q.Query is not null ? Query(q.Query) : Expr(q.Array!))})";
         }
 
@@ -273,13 +333,14 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                 return $"{Expr(q.Left)} {not}IN ({Query(q.Query)})";
             }
 
-            if (q.Array is PgArray a)
+            // pg_get_expr writes = ANY ((ARRAY['a'::character varying, ...])::text[]).
+            if ((Unparen(q.Array!) is PgCast { Operand: var inner } ? Unparen(inner) : Unparen(q.Array!)) is PgArray a)
             {
                 return $"{Expr(q.Left)} {not}IN ({string.Join(", ", a.Elements.Select(Expr))})";
             }
         }
 
-        return Unsupported($"ANY/ALL comparison has no {(toMySql ? My : "SQLite")} counterpart", Show(q.Left) + $" {q.Op} {q.Quantifier}(...)", "true");
+        return Unsupported($"ANY/ALL comparison has no {ctx.TargetDisplay} counterpart", Show(q.Left) + $" {q.Op} {q.Quantifier}(...)", toOracle ? "1 = 1" : "true");
     }
 
     private string Like(PgLike l)
@@ -287,6 +348,11 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
         if (toMySql)
         {
             return LikeToMySql(l);
+        }
+
+        if (toOracle)
+        {
+            return LikeToOracle(l);
         }
 
         var not = l.Not ? "NOT " : string.Empty;
@@ -325,9 +391,19 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             return BinaryToMySql(b);
         }
 
+        if (toOracle)
+        {
+            return BinaryToOracle(b);
+        }
+
         if (fromMySql && BinaryFromMySql(b) is { } fromMySqlBinary)
         {
             return fromMySqlBinary;
+        }
+
+        if (fromOracle && BinaryFromOracle(b) is { } fromOracleBinary)
+        {
+            return fromOracleBinary;
         }
 
         if (toSqlite && b.Op is "+" or "-" && Interval(b.Right) is { } right)
@@ -516,6 +592,16 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             return CastFromMySql(c);
         }
 
+        if (toOracle)
+        {
+            return CastToOracle(c);
+        }
+
+        if (fromOracle)
+        {
+            return CastFromOracle(c);
+        }
+
         var type = c.Type.ToLowerInvariant();
         if (type is "regclass" or "regproc" or "regtype" or "oid" or "name" && c.Operand is PgLiteral)
         {
@@ -558,6 +644,16 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             return TypedLiteralToMySql(t);
         }
 
+        if (toOracle)
+        {
+            return TypedLiteralToOracle(t);
+        }
+
+        if (fromOracle)
+        {
+            return TypedLiteralFromOracle(t);
+        }
+
         if (toPg)
         {
             return $"{t.Type} {Lit(t.Value)}";
@@ -577,6 +673,11 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
         var args = c.Args.ToList();
         var name = c.Function.Last.ToLowerInvariant();
+        if (fromOracle && c.Function.Parts.Count > 1 && OraclePackageCall(c, args) is { } package)
+        {
+            return package;
+        }
+
         var userFunction = c.Function.Parts.Count > 1 || ctx.Schema.Code.Any(x => x.Kind == Core.Conversion.PortableCodeKind.Function && x.Name.Name.Equals(c.Function.Last, StringComparison.OrdinalIgnoreCase));
         if (userFunction && !(toSqlite && name == "raise"))
         {
@@ -586,7 +687,7 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             }
 
             var schema = c.Function.Parts.Count > 1 ? c.Function.Parts[^2] : ctx.Schema.DefaultSchema;
-            if (toMySql)
+            if (toMySql || toOracle)
             {
                 return $"{ctx.Qualified(new Core.Conversion.PortableName(schema, c.Function.Last))}({string.Join(", ", args.Select(Expr))})";
             }
@@ -596,7 +697,9 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
         var result = toSqlite ? ToSqlite(name, args, c)
             : toMySql ? ToMySql(name, args, c)
+            : toOracle ? ToOracle(name, args, c)
             : fromMySql ? FromMySql(name, args, c)
+            : fromOracle ? FromOracle(name, args, c)
             : FromSqlite(name, args, c);
         return result + Over(c);
     }
@@ -699,7 +802,23 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
         var order = c.OrderBy.Count > 0 ? " " + OrderBy(c.OrderBy) : string.Empty;
         var filter = c.Filter is null ? string.Empty : $" FILTER (WHERE {Expr(c.Filter)})";
         var note = string.Empty;
-        if (toMySql)
+        if (toOracle)
+        {
+            if (c.Filter is not null)
+            {
+                // Oracle has no FILTER. Aggregates skip NULLs, so a CASE without ELSE gives the same result.
+                var condition = Cond(c.Filter);
+                values[0] = c.StarArg ? $"CASE WHEN {condition} THEN 1 END" : $"CASE WHEN {condition} THEN {values[0]} END";
+                filter = string.Empty;
+            }
+
+            if (order.Length > 0 && name != "JSON_ARRAYAGG")
+            {
+                order = string.Empty;
+                note = Note($"Oracle has no ORDER BY inside {name}(); it was left out");
+            }
+        }
+        else if (toMySql)
         {
             if (c.Filter is not null)
             {
@@ -992,10 +1111,30 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     public string Query(PgQuery q)
     {
+        var added = q.With.Select(c => c.Name).Where(cteNames.Add).ToList();
+        try
+        {
+            return QueryWithCtes(q);
+        }
+        finally
+        {
+            cteNames.ExceptWith(added);
+        }
+    }
+
+    private string QueryWithCtes(PgQuery q)
+    {
+        if (fromOracle)
+        {
+            q = RownumToLimit(q);
+        }
+
         var sb = new StringBuilder();
+        var recursive = q.Recursive || (fromOracle && OracleRecursive(q));
         if (q.With.Count > 0)
         {
-            sb.Append("WITH ").Append(q.Recursive ? "RECURSIVE " : string.Empty).Append(string.Join(", ", q.With.Select(c =>
+            // Oracle has no RECURSIVE keyword: a CTE that names itself is recursive.
+            sb.Append("WITH ").Append(recursive && !toOracle ? "RECURSIVE " : string.Empty).Append(string.Join(", ", q.With.Select(c =>
                 $"{ctx.Ident(c.Name)}{(c.Columns.Count == 0 ? string.Empty : "(" + string.Join(", ", c.Columns.Select(ctx.Ident)) + ")")} AS ({(c.Body is PgSelectStatement s ? Query(s.Query) : Statement(c.Body).TrimEnd(';'))})")))
                 .Append(' ');
         }
@@ -1006,12 +1145,25 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             sb.Append(' ').Append(OrderBy(q.OrderBy));
         }
 
-        if (q.Limit is not null)
+        if (toOracle)
+        {
+            // Oracle 12c+: OFFSET n ROWS FETCH NEXT m ROWS ONLY.
+            if (q.Offset is not null)
+            {
+                sb.Append(" OFFSET ").Append(Expr(q.Offset)).Append(" ROWS");
+            }
+
+            if (q.Limit is not null)
+            {
+                sb.Append(q.Offset is null ? " FETCH FIRST " : " FETCH NEXT ").Append(Expr(q.Limit)).Append(" ROWS ONLY");
+            }
+        }
+        else if (q.Limit is not null)
         {
             sb.Append(" LIMIT ").Append(Expr(q.Limit));
         }
 
-        if (q.Offset is not null)
+        if (q.Offset is not null && !toOracle)
         {
             // SQLite and MySQL have no OFFSET without LIMIT.
             sb.Append(q.Limit is null && toSqlite ? " LIMIT -1" : q.Limit is null && toMySql ? " LIMIT 18446744073709551615" : string.Empty).Append(" OFFSET ").Append(Expr(q.Offset));
@@ -1028,8 +1180,10 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
     private string Body(PgQueryBody body) => body switch
     {
         PgSelectCore s => Select(s),
+        PgSetOp op when toOracle => SetOpToOracle(op),
         PgSetOp op => $"{Body(op.Left)} {op.Op.ToUpperInvariant()}{(op.All ? " ALL" : string.Empty)} {Body(op.Right)}",
         PgNestedQuery n => toSqlite ? "SELECT * FROM (" + Query(n.Query) + ")" : "(" + Query(n.Query) + ")",
+        PgValuesBody v when toOracle => ValuesToOracle(v.Rows, []),
         PgValuesBody v => "VALUES " + ValuesRows(v.Rows),
         _ => Unsupported("query not translated", body.GetType().Name, "SELECT NULL"),
     };
@@ -1040,6 +1194,11 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     private string Select(PgSelectCore s)
     {
+        if (fromOracle)
+        {
+            s = OracleFrom(s);
+        }
+
         var sb = new StringBuilder("SELECT ");
         if (s.Distinct)
         {
@@ -1058,10 +1217,14 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
         {
             sb.Append(" FROM ").Append(string.Join(", ", s.From.Select(From)));
         }
+        else if (toOracle)
+        {
+            sb.Append(" FROM DUAL");
+        }
 
         if (s.Where is not null)
         {
-            sb.Append(" WHERE ").Append(Expr(s.Where));
+            sb.Append(" WHERE ").Append(Cond(s.Where));
         }
 
         if (s.GroupBy.Count > 0)
@@ -1071,7 +1234,7 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
         if (s.Having is not null)
         {
-            sb.Append(" HAVING ").Append(Expr(s.Having));
+            sb.Append(" HAVING ").Append(Cond(s.Having));
         }
 
         return sb.ToString();
@@ -1089,6 +1252,11 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
     public string From(PgFrom f)
     {
+        if (toOracle)
+        {
+            return FromToOracle(f);
+        }
+
         switch (f)
         {
             case PgTableRef t:
@@ -1111,7 +1279,9 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                     return MariaDbColumnAliases(s.Alias, s.ColumnAliases, Query(s.Query));
                 }
 
-                return $"{(s.Lateral && !toSqlite && !toMariaDb ? "LATERAL " : string.Empty)}({Query(s.Query)}){Alias(s.Alias, toSqlite ? [] : s.ColumnAliases)}";
+                // Oracle takes a derived table without an alias; PostgreSQL before 16 does not.
+                var derivedAlias = s.Alias ?? (fromOracle ? $"subquery{++derivedTables}" : null);
+                return $"{(s.Lateral && !toSqlite && !toMariaDb ? "LATERAL " : string.Empty)}({Query(s.Query)}){Alias(derivedAlias, toSqlite ? [] : s.ColumnAliases)}";
             case PgValuesRef v:
                 if (toMariaDb && v.Alias is not null && v.ColumnAliases.Count > 0)
                 {

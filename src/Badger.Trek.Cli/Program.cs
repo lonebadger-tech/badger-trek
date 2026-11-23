@@ -210,7 +210,7 @@ var convert = new Command("convert", "Convert a live database between SQL Server
 var convertOut = new Option<string>("--out", "-o") { Description = "Folder for the new project (must not contain one yet).", Required = true };
 var convertTo = new Option<string>("--to") { Description = "Target provider: sqlserver, postgresql, mysql, mariadb or sqlite.", Required = true };
 var convertFrom = new Option<string?>("--from-provider") { Description = "The source provider when the source is a --connection-string rather than an environment of the project in --project." };
-var convertNames = new Option<string?>("--names") { Description = "Identifiers in the target: lower (default for PostgreSQL), snake (CustomerOrder -> customer_order) or keep (default for SQL Server and SQLite)." };
+var convertNames = new Option<string?>("--names") { Description = "Identifiers in the target: lower (default for PostgreSQL), upper (default for Oracle), snake (CustomerOrder -> customer_order; CUSTOMER_ORDER on Oracle) or keep (default for SQL Server, MySQL, MariaDB and SQLite)." };
 convertNames.AcceptOnlyFromAmong("keep", "lower", "snake");
 var convertCaseSensitive = new Option<bool>("--case-sensitive") { Description = "Do not give PostgreSQL text columns a case-insensitive collation when the SQL Server database compares text case-insensitively." };
 var convertExclude = new Option<string[]>("--exclude") { Description = "schema.name glob of objects to leave out (* and ?). Repeatable." };

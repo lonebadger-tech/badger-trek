@@ -34,6 +34,9 @@ public static partial class ConversionProject
 
         // MySQL to MariaDB and back: by way of PostgreSQL, so each side's tested mappings apply.
         (Dialect.MySql, Dialect.MySql) when ctx.SourceMariaDb != ctx.TargetMariaDb => new ChainTranslator(ctx),
+        (Dialect.PostgreSql, Dialect.Oracle) => new Oracle.PgToOracleTranslator(ctx),
+        (Dialect.Oracle, Dialect.PostgreSql) => new Oracle.OracleToPgTranslator(ctx),
+        (_, Dialect.Oracle) or (Dialect.Oracle, _) => new ChainTranslator(ctx),
         _ => throw new Core.MigrationException($"Converting {ctx.SourceDisplay} to {ctx.TargetDisplay} is not supported."),
     };
 
@@ -241,6 +244,7 @@ public static partial class ConversionProject
         private readonly bool lite = ctx.Target == Dialect.Sqlite;
         private readonly bool ss = ctx.Target == Dialect.SqlServer;
         private readonly bool my = ctx.Target == Dialect.MySql;
+        private readonly bool ora = ctx.Target == Dialect.Oracle;
 
         /// <summary>The MySQL-dialect target is MariaDB: sequences, UCA 14 collations, no expression indexes.</summary>
         private readonly bool maria = ctx.TargetMariaDb;
@@ -267,7 +271,7 @@ public static partial class ConversionProject
         private string Unique(string schema, string name, string table)
         {
             var mapped = ctx.Names.Name(name);
-            if ((pg && Encoding.UTF8.GetByteCount(mapped) > 63) || (my && mapped.Length > 64))
+            if ((pg && Encoding.UTF8.GetByteCount(mapped) > 63) || (my && mapped.Length > 64) || (ora && Encoding.UTF8.GetByteCount(mapped) > 128))
             {
                 var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(mapped)))[..8].ToLowerInvariant();
                 mapped = mapped[..50] + "_" + hash;
@@ -297,7 +301,7 @@ public static partial class ConversionProject
 
         public (string, string) Schemas()
         {
-            if (lite || my)
+            if (lite || my || ora)
             {
                 return (string.Empty, string.Empty);
             }
@@ -318,7 +322,7 @@ public static partial class ConversionProject
 
         public (string, string) Types()
         {
-            if (lite || my)
+            if (lite || my || ora)
             {
                 // Enums and domains become their base type with checks on each column (MySQL: an ENUM column); NOCASE is built in.
                 return (string.Empty, string.Empty);
@@ -395,7 +399,27 @@ public static partial class ConversionProject
                     continue;
                 }
 
-                var type = Map(s.Type, s.Name.ToString()).Type;
+                if (ora)
+                {
+                    // Oracle sequences have no type: they hold up to 28 digits.
+                    var oracle = new StringBuilder($"CREATE SEQUENCE {name} START WITH {s.Start} INCREMENT BY {s.Increment}");
+                    if (s.Minimum is { } low)
+                    {
+                        oracle.Append(CultureInfo.InvariantCulture, $" MINVALUE {low}");
+                    }
+
+                    if (s.Maximum is { } high)
+                    {
+                        oracle.Append(CultureInfo.InvariantCulture, $" MAXVALUE {high}");
+                    }
+
+                    deploy.Add(oracle.Append(s.Cycle ? " CYCLE" : " NOCYCLE").Append(';').ToString());
+                    revert.Add($"DROP SEQUENCE {name};");
+                    continue;
+                }
+
+                // An Oracle sequence has no type of its own (NUMBER): it numbers like a bigint.
+                var type = ctx.Source == Dialect.Oracle ? (pg ? "bigint" : "bigint") : Map(s.Type, s.Name.ToString()).Type;
                 if (pg && type is not ("smallint" or "integer" or "bigint"))
                 {
                     type = "bigint";
@@ -463,12 +487,17 @@ public static partial class ConversionProject
         {
             var deploy = new List<string>();
             var revert = new List<string>();
+            if (ora && ctx.Schema.CaseInsensitive)
+            {
+                ctx.Issue("tables", $"{ctx.SourceDisplay} compared text case-insensitively; Oracle compares it case-sensitively, so unique keys and queries that relied on that behave differently (Oracle's BINARY_CI collation needs MAX_STRING_SIZE=EXTENDED)");
+            }
+
             foreach (var table in ctx.Schema.Tables)
             {
                 var (create, comments) = Table(table);
                 deploy.Add(create);
                 deploy.AddRange(comments);
-                revert.Add($"DROP TABLE {ctx.Qualified(table.Name)};");
+                revert.Add($"DROP TABLE {ctx.Qualified(table.Name)}{(ora ? " PURGE" : string.Empty)};");
             }
 
             return Ddl(deploy, revert);
@@ -502,6 +531,12 @@ public static partial class ConversionProject
                     ctx.Issue(owner, $"column {c.Name} ({c.Type}) is in a key or index, which {My} cannot build on unbounded text: it became {bounded}; check the longest value");
                     mapping = mapping with { Type = bounded };
                 }
+                else if (ora && keyColumns.Contains(c.Name) && mapping.Type is "CLOB" or "BLOB")
+                {
+                    var bounded = mapping.Type == "CLOB" ? "VARCHAR2(1000 CHAR)" : "RAW(2000)";
+                    ctx.Issue(owner, $"column {c.Name} ({c.Type}) is in a key or index, which Oracle cannot build on a LOB: it became {bounded}; check the longest value");
+                    mapping = mapping with { Type = bounded };
+                }
 
                 var sb = new StringBuilder(column);
                 var domain = DomainOf(c.Type);
@@ -522,6 +557,16 @@ public static partial class ConversionProject
                     else if (my)
                     {
                         sb.Append($" {mapping.Type} GENERATED ALWAYS AS ({expr}) {(c.ComputedStored ? "STORED" : "VIRTUAL")}");
+                    }
+                    else if (ora)
+                    {
+                        // Oracle's virtual columns are computed when read, and cannot be LOBs.
+                        var type = mapping.Type is "CLOB" ? "VARCHAR2(4000 CHAR)" : mapping.Type is "BLOB" ? "RAW(2000)" : mapping.Type;
+                        sb.Append($" {type} GENERATED ALWAYS AS ({expr}) VIRTUAL");
+                        if (c.ComputedStored)
+                        {
+                            ctx.Issue(owner, $"computed column {c.Name} is virtual (Oracle has no stored generated columns); index it if reads must be fast");
+                        }
                     }
                     else if (pg)
                     {
@@ -559,6 +604,10 @@ public static partial class ConversionProject
                 {
                     // MySQL to MariaDB or back: the collation names differ, the comparison rule is kept.
                     sb.Append(" COLLATE ").Append(collation);
+                }
+                else if (ora && mapping.IsText && (IsNoCase(c.Collation) || c.Collation is null || ctx.Source == Dialect.MySql))
+                {
+                    // Reported once for the conversion: Oracle compares text case-sensitively.
                 }
                 else if (c.Collation?.Equals("NOCASE", StringComparison.OrdinalIgnoreCase) == true && mapping.IsText && ss)
                 {
@@ -603,8 +652,9 @@ public static partial class ConversionProject
                 }
                 else if (c.Identity is { } id)
                 {
-                    sb.Append(pg
-                        ? $" GENERATED {(id.Always ? "BY DEFAULT" : "BY DEFAULT")} AS IDENTITY (START WITH {id.Seed} INCREMENT BY {id.Increment})"
+                    // BY DEFAULT: 'trek convert data' inserts the source's values.
+                    sb.Append(pg || ora
+                        ? $" GENERATED BY DEFAULT AS IDENTITY (START WITH {id.Seed} INCREMENT BY {id.Increment})"
                         : $" IDENTITY({id.Seed}, {id.Increment})");
                 }
 
@@ -618,7 +668,7 @@ public static partial class ConversionProject
                 if (defaultExpr is not null)
                 {
                     var value = translator.Expression(StripParens(defaultExpr), new ExpressionSite(owner, mapping.Type));
-                    sb.Append(my ? MySqlDefault(value, mapping.Type) : lite ? $" DEFAULT ({value})" : pg ? $" DEFAULT {value}" : $" CONSTRAINT {ctx.Quote(Unique(schema, $"DF_{table.Name.Name}_{c.Name}", table.Name.Name))} DEFAULT ({value})");
+                    sb.Append(my ? MySqlDefault(value, mapping.Type) : lite ? $" DEFAULT ({value})" : pg || ora ? $" DEFAULT {value}" : $" CONSTRAINT {ctx.Quote(Unique(schema, $"DF_{table.Name.Name}_{c.Name}", table.Name.Name))} DEFAULT ({value})");
                 }
 
                 sb.Append(c.Nullable ? (ss ? " NULL" : string.Empty) : " NOT NULL");
@@ -646,7 +696,7 @@ public static partial class ConversionProject
                 }
                 else if (c.Comment is { Length: > 0 } comment && !my)
                 {
-                    comments.Add(pg
+                    comments.Add(pg || ora
                         ? $"COMMENT ON COLUMN {tableName}.{column} IS {ctx.Literal(comment)};"
                         : $"EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = {ctx.Literal(comment)}, @level0type = N'SCHEMA', @level0name = {ctx.Literal(schema)}, @level1type = N'TABLE', @level1name = {ctx.Literal(ctx.Names.Name(table.Name.Name))}, @level2type = N'COLUMN', @level2name = {ctx.Literal(ctx.Names.Name(c.Name))};");
                 }
@@ -677,7 +727,7 @@ public static partial class ConversionProject
                 {
                     ctx.Issue(owner, pg
                         ? $"unique constraint {u.Name} on nullable columns now allows several NULLs (PostgreSQL's rule); add NULLS NOT DISTINCT (PostgreSQL 15+) to keep SQL Server's"
-                        : $"unique constraint {u.Name} on nullable columns now allows several NULLs (SQLite's rule)");
+                        : $"unique constraint {u.Name} on nullable columns now allows several NULLs ({ctx.TargetDisplay}'s rule)");
                 }
             }
 
@@ -707,7 +757,7 @@ public static partial class ConversionProject
             }
             else if (table.Comment is { Length: > 0 } tableComment)
             {
-                comments.Insert(0, pg
+                comments.Insert(0, pg || ora
                     ? $"COMMENT ON TABLE {tableName} IS {ctx.Literal(tableComment)};"
                     : $"EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = {ctx.Literal(tableComment)}, @level0type = N'SCHEMA', @level0name = {ctx.Literal(schema)}, @level1type = N'TABLE', @level1name = {ctx.Literal(ctx.Names.Name(table.Name.Name))};");
             }
@@ -823,16 +873,22 @@ public static partial class ConversionProject
                 var tableName = ctx.Qualified(table.Name);
                 foreach (var fk in table.ForeignKeys)
                 {
-                    var name = ctx.Quote(Unique(schema, fk.Name ?? (pg || my ? Generated(table.Name.Name, string.Join('_', fk.Columns) + "_fkey") : $"FK_{table.Name.Name}_{fk.Referenced.Name}"), table.Name.Name));
+                    var name = ctx.Quote(Unique(schema, fk.Name ?? (pg || my || ora ? Generated(table.Name.Name, string.Join('_', fk.Columns) + "_fkey") : $"FK_{table.Name.Name}_{fk.Referenced.Name}"), table.Name.Name));
                     if (my && (fk.OnDelete == "SET DEFAULT" || fk.OnUpdate == "SET DEFAULT"))
                     {
                         ctx.Issue(table.Name.ToString(), $"foreign key {fk.Name}: InnoDB does not support SET DEFAULT; it became NO ACTION");
                     }
+                    if (ora && (fk.OnUpdate is not ("NO ACTION" or "RESTRICT") || fk.OnDelete is "SET DEFAULT"))
+                    {
+                        ctx.Issue(table.Name.ToString(), $"foreign key {fk.Name}: Oracle has no ON UPDATE actions or ON DELETE SET DEFAULT; they became NO ACTION (use a trigger if updates must cascade)");
+                    }
+
                     var sb = new StringBuilder($"ALTER TABLE {tableName} ADD CONSTRAINT {name} FOREIGN KEY ({Columns(fk.Columns)}) REFERENCES {ctx.Qualified(fk.Referenced)} ({Columns(fk.ReferencedColumns)})");
                     sb.Append(Action("DELETE", fk.OnDelete)).Append(Action("UPDATE", fk.OnUpdate));
                     cascades |= fk.OnDelete is not ("NO ACTION" or "RESTRICT") || fk.OnUpdate is not ("NO ACTION" or "RESTRICT");
-                    if (pg)
+                    if (pg || ora)
                     {
+                        // 'trek convert data' defers them, so tables load in any order.
                         sb.Append(" DEFERRABLE INITIALLY IMMEDIATE");
                     }
 
@@ -852,8 +908,9 @@ public static partial class ConversionProject
         private string Action(string verb, string action) => action switch
         {
             "NO ACTION" => string.Empty,
-            "SET DEFAULT" when my => string.Empty,
-            "RESTRICT" => ss ? string.Empty : $" ON {verb} RESTRICT",
+            "SET DEFAULT" when my || ora => string.Empty,
+            _ when ora && verb == "UPDATE" => string.Empty,
+            "RESTRICT" => ss || ora ? string.Empty : $" ON {verb} RESTRICT",
             _ => $" ON {verb} {action}",
         };
 
@@ -887,7 +944,7 @@ public static partial class ConversionProject
                         continue;
                     }
 
-                    var kind = my && method is "FULLTEXT" or "SPATIAL" ? method + " " : string.Empty;
+                    var kind = my && method is "FULLTEXT" or "SPATIAL" ? method + " " : ora && method == "bitmap" ? "BITMAP " : string.Empty;
                     if (method is "FULLTEXT" or "SPATIAL" && !my)
                     {
                         ctx.Issue(owner, $"MySQL {method} index {index.Name} became a B-tree index; use the target's full-text or spatial features instead");
@@ -900,6 +957,12 @@ public static partial class ConversionProject
                     if (my && index.Filter is not null && index.Unique)
                     {
                         ctx.Issue(owner, $"filtered unique index {index.Name} is not converted: {My} has no filtered indexes; enforce the rule with a generated column or a trigger");
+                        continue;
+                    }
+
+                    if (ora && index.Filter is not null && index.Unique)
+                    {
+                        ctx.Issue(owner, $"filtered unique index {index.Name} is not converted: Oracle has no filtered indexes; a unique function-based index on CASE WHEN <filter> THEN <columns> END enforces the same rule");
                         continue;
                     }
 
@@ -938,18 +1001,18 @@ public static partial class ConversionProject
 
                     var columns = string.Join(", ", index.Columns.Select(c => Key(c) + (c.Descending ? " DESC" : string.Empty)));
                     var sb = new StringBuilder($"CREATE {(index.Unique ? "UNIQUE " : string.Empty)}{kind}{(ss ? "NONCLUSTERED " : string.Empty)}INDEX {name} ON {tableName} ({columns})");
-                    if (index.Included.Count > 0 && (lite || my))
+                    if (index.Included.Count > 0 && (lite || my || ora))
                     {
-                        ctx.Issue(owner, $"index {index.Name}: {(my ? My : "SQLite")} has no INCLUDE columns; they were left out");
+                        ctx.Issue(owner, $"index {index.Name}: {(lite ? "SQLite" : ctx.TargetDisplay)} has no INCLUDE columns; they were left out");
                     }
                     else if (index.Included.Count > 0)
                     {
                         sb.Append($" INCLUDE ({Columns(index.Included)})");
                     }
 
-                    if (index.Filter is not null && my)
+                    if (index.Filter is not null && (my || ora))
                     {
-                        ctx.Issue(owner, $"index {index.Name}: {My} has no filtered indexes; it indexes every row");
+                        ctx.Issue(owner, $"index {index.Name}: {ctx.TargetDisplay} has no filtered indexes; it indexes every row");
                     }
                     else if (index.Filter is not null)
                     {
@@ -957,7 +1020,7 @@ public static partial class ConversionProject
                     }
 
                     deploy.Add(sb.Append(';').ToString());
-                    revert.Add(lite ? $"DROP INDEX {name};" : pg ? $"DROP INDEX {ctx.Quote(schema)}.{name};" : $"DROP INDEX {name} ON {tableName};");
+                    revert.Add(lite || ora ? $"DROP INDEX {name};" : pg ? $"DROP INDEX {ctx.Quote(schema)}.{name};" : $"DROP INDEX {name} ON {tableName};");
                 }
             }
 

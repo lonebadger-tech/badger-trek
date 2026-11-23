@@ -35,6 +35,7 @@ internal sealed class ChainTranslator : ITranslator
             Dialect.SqlServer => new TSqlToPg.TSqlToPgTranslator(first),
             Dialect.Sqlite => new Sqlite.SqliteToPgTranslator(first),
             Dialect.MySql => new MySql.MySqlToPgTranslator(first),
+            Dialect.Oracle => new Oracle.OracleToPgTranslator(first),
             _ => throw new InvalidOperationException($"No chain from {outer.Source}."),
         };
         second = new ConversionContext(IntermediateSchema(first), new ConversionOptions
@@ -48,6 +49,7 @@ internal sealed class ChainTranslator : ITranslator
             Dialect.Sqlite => new Sqlite.PgToSqliteTranslator(second),
             Dialect.SqlServer => new PgToTSqlTranslator(second),
             Dialect.MySql => new MySql.PgToMySqlTranslator(second),
+            Dialect.Oracle => new Oracle.PgToOracleTranslator(second),
             _ => throw new InvalidOperationException($"No chain to {outer.Target}."),
         };
     }

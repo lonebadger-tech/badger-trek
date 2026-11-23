@@ -8,14 +8,15 @@ public enum Dialect
     SqlServer,
     Sqlite,
     MySql,
+    Oracle,
 }
 
 public sealed record ConversionOptions
 {
-    /// <summary>The provider id of the target ("postgresql", "sqlserver", "sqlite", "mysql" or "mariadb").</summary>
+    /// <summary>The provider id of the target ("postgresql", "sqlserver", "sqlite", "mysql", "mariadb" or "oracle").</summary>
     public required string TargetProvider { get; init; }
 
-    /// <summary>Null = Lower when converting to PostgreSQL, Keep when converting to SQL Server.</summary>
+    /// <summary>Null = Lower when converting to PostgreSQL, Upper to Oracle, Keep otherwise.</summary>
     public NameStyle? Names { get; init; }
 
     /// <summary>Do not give PostgreSQL text columns a case-insensitive collation when the SQL Server source compares case-insensitively.</summary>
@@ -47,8 +48,8 @@ public sealed class ConversionContext
             throw new Core.MigrationException($"The database is already {DisplayOf(Target, TargetMariaDb)}; pass --to with a different provider.");
         }
 
-        var style = options.Names ?? (Target == Dialect.PostgreSql ? NameStyle.Lower : NameStyle.Keep);
-        Names = new NameMapper(schema.DefaultSchema, DefaultSchemaOf(Target), style);
+        var style = options.Names ?? (Target switch { Dialect.PostgreSql => NameStyle.Lower, Dialect.Oracle => NameStyle.Upper, _ => NameStyle.Keep });
+        Names = new NameMapper(schema.DefaultSchema, DefaultSchemaOf(Target), style, foldUpper: Target == Dialect.Oracle);
         CaseInsensitiveCollation = Target is Dialect.PostgreSql or Dialect.Sqlite or Dialect.MySql && schema.CaseInsensitive && !options.CaseSensitive;
         enums = schema.Enums.ToDictionary(e => e.Name.Key, StringComparer.OrdinalIgnoreCase);
         domains = schema.Domains.ToDictionary(d => d.Name.Key, StringComparer.OrdinalIgnoreCase);
@@ -82,6 +83,13 @@ public sealed class ConversionContext
     {
         var t = sourceType.Trim().ToLowerInvariant();
         var name = t.Split('(')[0].Trim();
+        if (Source == Dialect.Oracle)
+        {
+            return name is "boolean" ? ColumnKind.Boolean
+                : name is "varchar2" or "nvarchar2" or "varchar" or "char" or "nchar" or "clob" or "nclob" or "long" ? ColumnKind.Text
+                : ColumnKind.Other;
+        }
+
         if (Source == Dialect.MySql)
         {
             return name is "bool" or "boolean" || t.StartsWith("tinyint(1)", StringComparison.Ordinal) ? ColumnKind.Boolean
@@ -170,7 +178,7 @@ public sealed class ConversionContext
     public static string DefaultSchemaOf(Dialect dialect) => dialect switch
     {
         Dialect.PostgreSql => "public",
-        Dialect.Sqlite or Dialect.MySql => FlatSchema,
+        Dialect.Sqlite or Dialect.MySql or Dialect.Oracle => FlatSchema,
         _ => "dbo",
     };
 
@@ -178,7 +186,7 @@ public sealed class ConversionContext
     public const string FlatSchema = "main";
 
     /// <summary>The target has no schemas inside the database: names are flattened.</summary>
-    public bool FlatTarget => Target is Dialect.Sqlite or Dialect.MySql;
+    public bool FlatTarget => Target is Dialect.Sqlite or Dialect.MySql or Dialect.Oracle;
 
     /// <summary>
     /// A table, view or other schema object's name in the target. SQLite has no schemas, and in MySQL a schema is the
@@ -215,7 +223,26 @@ public sealed class ConversionContext
         Dialect.PostgreSql => Providers.PostgreSql.Scripting.Sql.Ident(name),
         Dialect.Sqlite => SqliteQuote(name),
         Dialect.MySql => MySqlQuote(name),
+        Dialect.Oracle => OracleQuote(name),
         _ => TSqlQuote(name),
+    };
+
+    /// <summary>Oracle: bare when Oracle would store the name that way (upper case, not reserved), double-quoted otherwise.</summary>
+    public static string OracleQuote(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, "^[A-Z][A-Z0-9_$#]*$") && !OracleReserved.Contains(name) ? name : "\"" + name.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    /// <summary>An Oracle string literal (no escape characters; '' for a quote).</summary>
+    public static string OracleLiteral(string text) => "'" + text.Replace("'", "''", StringComparison.Ordinal) + "'";
+
+    private static readonly HashSet<string> OracleReserved = new(StringComparer.Ordinal)
+    {
+        "ACCESS", "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "AUDIT", "BETWEEN", "BY", "CHAR", "CHECK", "CLUSTER", "COLUMN", "COMMENT", "COMPRESS",
+        "CONNECT", "CREATE", "CURRENT", "DATE", "DECIMAL", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "EXCLUSIVE", "EXISTS", "FILE", "FLOAT",
+        "FOR", "FROM", "GRANT", "GROUP", "HAVING", "IDENTIFIED", "IMMEDIATE", "IN", "INCREMENT", "INDEX", "INITIAL", "INSERT", "INTEGER", "INTERSECT", "INTO",
+        "IS", "LEVEL", "LIKE", "LOCK", "LONG", "MAXEXTENTS", "MINUS", "MLSLABEL", "MODE", "MODIFY", "NOAUDIT", "NOCOMPRESS", "NOT", "NOWAIT", "NULL", "NUMBER",
+        "OF", "OFFLINE", "ON", "ONLINE", "OPTION", "OR", "ORDER", "PCTFREE", "PRIOR", "PUBLIC", "RAW", "RENAME", "RESOURCE", "REVOKE", "ROW", "ROWID", "ROWNUM",
+        "ROWS", "SELECT", "SESSION", "SET", "SHARE", "SIZE", "SMALLINT", "START", "SUCCESSFUL", "SYNONYM", "SYSDATE", "TABLE", "THEN", "TO", "TRIGGER", "UID",
+        "UNION", "UNIQUE", "UPDATE", "USER", "VALIDATE", "VALUES", "VARCHAR", "VARCHAR2", "VIEW", "WHENEVER", "WHERE", "WITH",
     };
 
     /// <summary>MySQL: always backquoted (its reserved words change between releases).</summary>
@@ -251,6 +278,7 @@ public sealed class ConversionContext
     {
         Dialect.SqlServer => Providers.SqlServer.Scripting.Sql.Literal(text),
         Dialect.MySql => MySqlLiteral(text),
+        Dialect.Oracle => OracleLiteral(text),
         _ => Providers.PostgreSql.Scripting.Sql.Literal(text),
     };
 
@@ -260,7 +288,8 @@ public sealed class ConversionContext
         "sqlserver" => Dialect.SqlServer,
         "sqlite" or "sqlite3" => Dialect.Sqlite,
         "mysql" or MariaDbProvider => Dialect.MySql,
-        _ => throw new Core.MigrationException($"trek convert works between sqlserver, postgresql, mysql, mariadb and sqlite, not '{provider}'."),
+        "oracle" => Dialect.Oracle,
+        _ => throw new Core.MigrationException($"trek convert works between sqlserver, postgresql, mysql, mariadb, oracle and sqlite, not '{provider}'."),
     };
 
     /// <summary>A provider id or alias as its canonical id ("postgres" is "postgresql"); MariaDB's stays "mariadb".</summary>
@@ -273,6 +302,7 @@ public sealed class ConversionContext
         Dialect.PostgreSql => "postgresql",
         Dialect.Sqlite => "sqlite",
         Dialect.MySql => mariaDb ? MariaDbProvider : "mysql",
+        Dialect.Oracle => "oracle",
         _ => "sqlserver",
     };
 
@@ -282,6 +312,7 @@ public sealed class ConversionContext
         Dialect.SqlServer => "SQL Server",
         Dialect.Sqlite => "SQLite",
         Dialect.MySql => mariaDb ? "MariaDB" : "MySQL",
+        Dialect.Oracle => "Oracle",
         _ => "PostgreSQL",
     };
 

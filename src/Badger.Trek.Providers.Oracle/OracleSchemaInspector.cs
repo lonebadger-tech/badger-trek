@@ -65,7 +65,9 @@ public sealed partial class OracleSchemaInspector : ISchemaInspector
         foreach (var r in (await Q("SELECT table_name AS t, column_name AS c, generation_type AS gen, identity_options AS opts FROM all_tab_identity_cols WHERE owner = :o"))
             .Where(r => tables.Contains(S(r["t"]))))
         {
-            lines.Add($"identity|{S(r["t"])}|{S(r["c"])}|{S(r["gen"])}|{S(r["opts"])}");
+            // Where an identity starts is data, like a sequence's next value: loading rows moves it (START WITH LIMIT VALUE).
+            var options = Regex.Replace(S(r["opts"]), @"START WITH:\s*-?\d+,?\s*", string.Empty);
+            lines.Add($"identity|{S(r["t"])}|{S(r["c"])}|{S(r["gen"])}|{options}");
         }
 
         // Constraints. A NOT NULL check Oracle made for a NOT NULL column is the column's null=N already.

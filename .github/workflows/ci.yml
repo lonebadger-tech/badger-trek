@@ -162,6 +162,10 @@ jobs:
       - run: dotnet test tests/Badger.Trek.Providers.Oracle.Tests -c Release
         env:
           TREK_TEST_ORACLE_IMAGE: ${{ matrix.image }}
+      - if: always()
+        run: dotnet test tests/Badger.Trek.Conversion.IntegrationTests -c Release --filter "FullyQualifiedName~OracleConversionTests"
+        env:
+          TREK_TEST_ORACLE_IMAGE: ${{ matrix.image }}
 
   # Every PostgreSQL major version still supported by the PostgreSQL project (5 years each): the provider's
   # conformance and feature tests against each.

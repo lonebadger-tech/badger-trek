@@ -20,7 +20,8 @@ Delete this file when the items below are done (it is not documentation).
 - Oracle support (user's request, 2026-11-20): 19c and 26ai; CI tests 26ai only (Oracle Database Free,
   gvenzl/oracle-free:23-slim-faststart), 19c through oracle.minVersion lint, checked by hand. Four PRs:
   (1) provider core: done in the oracle-provider PR; (2) add --from-diff / diff-schema --script: done in the
-  oracle-from-diff PR (shadow user, model from the ALL_* views); (3) trek convert to and from Oracle in every direction; (4) imports (Flyway jdbc:oracle, Sqitch
+  oracle-from-diff PR (shadow user, model from the ALL_* views); (3) trek convert to and from Oracle in every direction: done in the oracle-convert PR (tables, keys,
+  indexes, views, data; PL/SQL commented out); (4) imports (Flyway jdbc:oracle, Sqitch
   oracle engine, EF Core Oracle provider) and baseline --from. Release 0.7.0 only after all four.
 
 - Dogfooding suggestions not done: `baseline --check-schema`, excluding objects from the schema fingerprint (e.g. an
