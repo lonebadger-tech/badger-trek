@@ -29,7 +29,9 @@ public static partial class ForeignJournal
 
     public static async Task<IReadOnlyList<FlywayHistoryRow>> ReadFlywayAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
-        var rows = await Query(session, $"SELECT installed_rank, version, type, checksum, success, script FROM {provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)} ORDER BY installed_rank", schema, table, "Flyway", cancellationToken).ConfigureAwait(false);
+        // Flyway quotes its column names on Oracle, so they are lower case there.
+        var c = (string name) => provider.QuoteIdentifier(name);
+        var rows = await Query(session, $"SELECT {c("installed_rank")}, {c("version")}, {c("type")}, {c("checksum")}, {c("success")}, {c("script")} FROM {Table(provider, schema, table)} ORDER BY {c("installed_rank")}", schema, table, "Flyway", cancellationToken).ConfigureAwait(false);
         return rows.Select(r => new FlywayHistoryRow(
             System.Convert.ToInt32(r["installed_rank"], CultureInfo.InvariantCulture),
             r["version"] as string,
@@ -43,7 +45,7 @@ public static partial class ForeignJournal
     public static async Task<IReadOnlyList<string>> ReadEfAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
         var column = provider.QuoteIdentifier("MigrationId");
-        var rows = await Query(session, $"SELECT {column} AS migration_id FROM {provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)} ORDER BY {column}", schema, table, "Entity Framework", cancellationToken).ConfigureAwait(false);
+        var rows = await Query(session, $"SELECT {column} AS migration_id FROM {Table(provider, schema, table)} ORDER BY {column}", schema, table, "Entity Framework", cancellationToken).ConfigureAwait(false);
         return rows.Select(r => (string)r["migration_id"]!).ToList();
     }
 
@@ -82,13 +84,13 @@ public static partial class ForeignJournal
 
     public static async Task<IReadOnlyList<string>> ReadDbUpAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
-        var rows = await Query(session, $"SELECT ScriptName FROM {provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)}", schema, table, "DbUp", cancellationToken).ConfigureAwait(false);
+        var rows = await Query(session, $"SELECT ScriptName FROM {Table(provider, schema, table)}", schema, table, "DbUp", cancellationToken).ConfigureAwait(false);
         return rows.Select(r => (string)r["ScriptName"]!).ToList();
     }
 
     public static async Task<IReadOnlyList<GrateScriptRun>> ReadGrateAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
-        var name = $"{provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)}";
+        var name = Table(provider, schema, table);
         var rows = await Query(session, $"SELECT script_name, text_hash, one_time_script FROM {name} sr WHERE id = (SELECT MAX(id) FROM {name} sr2 WHERE sr2.script_name = sr.script_name)", schema, table, "grate", cancellationToken).ConfigureAwait(false);
         return rows.Select(r => new GrateScriptRun((string)r["script_name"]!, r["text_hash"] as string, System.Convert.ToBoolean(r["one_time_script"] ?? false, CultureInfo.InvariantCulture))).ToList();
     }
@@ -180,7 +182,7 @@ public static partial class ForeignJournal
 
     public static async Task<IReadOnlyList<SqitchChangeRow>> ReadSqitchAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
-        var rows = await Query(session, $"SELECT change, project, script_hash FROM {provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)} ORDER BY committed_at, change_id", schema, table, "Sqitch", cancellationToken).ConfigureAwait(false);
+        var rows = await Query(session, $"SELECT change, project, script_hash FROM {Table(provider, schema, table)} ORDER BY committed_at, change_id", schema, table, "Sqitch", cancellationToken).ConfigureAwait(false);
         return rows.Select(r => new SqitchChangeRow((string)r["change"]!, (string)r["project"]!, r["script_hash"] as string)).ToList();
     }
 
@@ -349,6 +351,13 @@ public static partial class ForeignJournal
         return lastRan < 0 ? null : changes[lastRan].Name;
     }
 
+    /// <summary>"schema.table" for messages; just the table when the schema is empty (the session's own, as on Oracle).</summary>
+    public static string DisplayName(string schema, string table) => schema.Length == 0 ? table : $"{schema}.{table}";
+
+    /// <summary>The quoted table, qualified unless the schema is empty (the session's current schema).</summary>
+    private static string Table(IDatabaseProvider provider, string schema, string table) =>
+        schema.Length == 0 ? provider.QuoteIdentifier(table) : $"{provider.QuoteIdentifier(schema)}.{provider.QuoteIdentifier(table)}";
+
     private static bool IsBaselineRow(FlywayHistoryRow row) => row.Type.Contains("BASELINE", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<IReadOnlyList<IReadOnlyDictionary<string, object?>>> Query(IDatabaseSession session, string sql, string schema, string table, string tool, CancellationToken cancellationToken)
@@ -359,7 +368,7 @@ public static partial class ForeignJournal
         }
         catch (Exception ex) when (ex is not OperationCanceledException and not MigrationException)
         {
-            throw new MigrationException($"Could not read {tool}'s journal {schema}.{table}: {ex.Message}", ex);
+            throw new MigrationException($"Could not read {tool}'s journal {DisplayName(schema, table)}: {ex.Message}", ex);
         }
     }
 

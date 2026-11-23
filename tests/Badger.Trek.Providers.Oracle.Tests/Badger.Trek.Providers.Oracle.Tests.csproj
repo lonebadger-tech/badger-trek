@@ -18,6 +18,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="..\Badger.Trek.Core.Tests\EfScripts\oracle\*.sql" LinkBase="EfScripts\oracle" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Badger.Trek.Providers.Oracle\Badger.Trek.Providers.Oracle.csproj" />
     <ProjectReference Include="..\Badger.Trek.Providers.Testing\Badger.Trek.Providers.Testing.csproj" />
   </ItemGroup>

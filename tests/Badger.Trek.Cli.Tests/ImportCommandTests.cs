@@ -159,6 +159,96 @@ public sealed class ImportCommandTests : IDisposable
         Assert.Contains(warnings, w => w.Contains("prepareThreshold", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("jdbc:oracle:thin:@db.example.com:1522/MYAPP_PROD", "db.example.com", 1522, "MYAPP_PROD", null)]
+    [InlineData("jdbc:oracle:thin:@//localhost/FREEPDB1", "localhost", null, "FREEPDB1", null)]
+    [InlineData("jdbc:oracle:thin:@tcps://adb.eu-frankfurt-1.oraclecloud.com:1522/abc_high.adb.oraclecloud.com?wallet_location=/w&ssl_server_dn_match=true", "adb.eu-frankfurt-1.oraclecloud.com", 1522, "abc_high.adb.oraclecloud.com", "strict")]
+    [InlineData("jdbc:oracle:thin:scott/plain@legacy:1521:ORCL", "legacy", 1521, "ORCL", null)]
+    [InlineData("jdbc:oracle:thin:@[::1]:1521/FREEPDB1", "::1", 1521, "FREEPDB1", null)]
+    public void Oracle_jdbc_urls_map_to_environments(string url, string host, int? port, string database, string? tls)
+    {
+        var warnings = new List<string>();
+        var settings = JdbcOracle.Map(new ConnectionToImport("prod", url, null, null), warnings)!;
+
+        Assert.Equal((host, port, database, "password", tls), ((string?)settings["host"], (int?)settings["port"], (string?)settings["database"], (string?)settings["authentication"], (string?)settings["tls"]?["mode"]));
+        Assert.DoesNotContain("plain", settings.ToJsonString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(warnings, w => w.Contains("plain", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Oracle_jdbc_sid_descriptor_and_alias_urls()
+    {
+        var warnings = new List<string>();
+        var sid = JdbcOracle.Map(new ConnectionToImport("default", "jdbc:oracle:thin:scott/tiger@legacy:1521:ORCL", null, null), warnings)!;
+        Assert.Equal(("scott", "${env:FLYWAY_PASSWORD}"), ((string?)sid["user"], (string?)sid["password"]));
+        Assert.Contains(warnings, w => w.Contains("SID ORCL", StringComparison.Ordinal));
+        Assert.Contains(warnings, w => w.Contains("FLYWAY_PASSWORD", StringComparison.Ordinal));
+
+        warnings.Clear();
+        const string descriptor = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=h)(PORT=2484))(CONNECT_DATA=(SERVICE_NAME=s)))";
+        var full = JdbcOracle.Map(new ConnectionToImport("x", "jdbc:oracle:thin:@" + descriptor, "${env.DB_USER}", "${env.DB_PASSWORD}"), warnings)!;
+        Assert.Equal(("Data Source=" + descriptor, "mandatory", "${env:DB_USER}", "${env:DB_PASSWORD}"), ((string?)full["connectionString"], (string?)full["tls"]!["mode"], (string?)full["user"], (string?)full["password"]));
+        Assert.Null(full["host"]);
+
+        warnings.Clear();
+        var alias = JdbcOracle.Map(new ConnectionToImport("x", "jdbc:oracle:thin:@mydb_high?TNS_ADMIN=/wallets/mydb&oracle.jdbc.fanEnabled=false", "app", null), warnings)!;
+        Assert.Equal(("Data Source=mydb_high", "/wallets/mydb"), ((string?)alias["connectionString"], (string?)alias["connectionProperties"]!["TNS_Admin"]));
+        Assert.Contains(warnings, w => w.Contains("oracle.jdbc.fanEnabled", StringComparison.Ordinal));
+
+        warnings.Clear();
+        Assert.Null(JdbcOracle.Map(new ConnectionToImport("x", "jdbc:postgresql://h/db", null, null), warnings));
+        Assert.Contains(warnings, w => w.Contains("is not an Oracle JDBC URL", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Imports_can_target_oracle()
+    {
+        var flyway = Path.Combine(root, "flyway-ora");
+        Directory.CreateDirectory(Path.Combine(flyway, "sql"));
+        File.WriteAllText(Path.Combine(flyway, "flyway.toml"), """
+            [flyway]
+            environment = "dev"
+            [environments.dev]
+            url = "jdbc:oracle:thin:@localhost:1521/FREEPDB1"
+            user = "app"
+            password = "${env.DEV_DB_PASSWORD}"
+            """);
+        File.WriteAllText(Path.Combine(flyway, "sql", "V1__Init.sql"), "CREATE TABLE t (id NUMBER(10));\n\nBEGIN\n  INSERT INTO t VALUES (1);\nEND;\n/\n");
+        var target = Path.Combine(root, "trek-ora-flyway");
+
+        Assert.Equal(0, Commands.ImportFlyway(G(target), flyway, null, [], dryRun: false, providerId: "oracle"));
+        var config = TrekConfig.Load(target);
+        Assert.Equal("oracle", config.Provider);
+        Environment.SetEnvironmentVariable("DEV_DB_PASSWORD", "from-the-environment");
+        var dev = config.ResolveEnvironment("dev", null);
+        Assert.Equal(("localhost", 1521, "FREEPDB1", "app"), (dev.Host, dev.Port!.Value, dev.Database, dev.User));
+        Assert.Equal(0, Commands.PlanCheck(G(target)));
+
+        // Sqitch's Oracle engine moves to the Oracle provider by itself.
+        var sqitch = Path.Combine(root, "sqitch-ora");
+        Directory.CreateDirectory(Path.Combine(sqitch, "deploy"));
+        File.WriteAllText(Path.Combine(sqitch, "sqitch.conf"), "[core]\n\tengine = oracle\n");
+        File.WriteAllText(Path.Combine(sqitch, "sqitch.plan"), "%project=flipr\nusers 2026-11-03T20:56:05Z A <a@b>\n");
+        File.WriteAllText(Path.Combine(sqitch, "deploy", "users.sql"), "CREATE TABLE users (nick VARCHAR2(100));\n");
+        target = Path.Combine(root, "trek-ora-sqitch");
+
+        Assert.Equal(0, Commands.ImportSqitch(G(target), sqitch, null, dryRun: false));
+        Assert.Equal("oracle", TrekConfig.Load(target).Provider);
+        Assert.Equal(0, Commands.PlanCheck(G(target)));
+    }
+
+    [Fact]
+    public void Ef_scripts_for_oracle_import_to_an_oracle_project()
+    {
+        var oracle = Path.Combine(AppContext.BaseDirectory, "EfScripts", "oracle");
+        var target = Path.Combine(root, "trek-ora-ef");
+
+        Assert.Equal(0, Commands.ImportEf(G(target), Path.Combine(oracle, "up.sql"), Path.Combine(oracle, "down.sql"), null, null, dryRun: false));
+
+        Assert.Equal("oracle", TrekConfig.Load(target).Provider);
+        Assert.Equal(0, Commands.PlanCheck(G(target)));
+    }
+
     [Fact]
     public void Init_for_postgresql_writes_a_postgres_configuration()
     {

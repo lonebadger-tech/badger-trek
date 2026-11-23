@@ -180,6 +180,32 @@ def releases():
     body = f"""
 <section class="release" id="v{VERSION}">
   <h2>Version {VERSION} <span class="date">{RELEASE_DATE}</span></h2>
+  <h3>Oracle</h3>
+  <ul>
+    <li><code>trek init --provider oracle</code>, for Oracle Database 19c and 26ai, the long-term releases in Oracle's Premier Support (26ai, through Oracle Database Free, is tested on every build; 19c is covered by <code>oracle.minVersion</code>, and lint TREK008 flags SQL only 26ai runs). Deploy, revert, verify, repeatables, bundles, the schema fingerprint and <code>diff-schema</code> work as on the other databases. See <a href="{BASE}/docs/oracle/">Oracle</a></li>
+    <li>trek deploys to the login's schema, or to <code>schema</code>, and keeps its journal there in <code>TREK_*</code> tables. Oracle commits DDL as it runs, so changes run without a transaction</li>
+    <li>Scripts are read as SQL*Plus reads them: <code>;</code> ends a statement, a line holding <code>/</code> ends a PL/SQL block, SQL*Plus settings such as <code>PROMPT</code> and <code>SET</code> are skipped, and <code>EXEC</code> works</li>
+    <li>Connect by host and service name, EZConnect, a TNS alias or a descriptor, over TCPS with a wallet or through an SSH tunnel</li>
+    <li><code>trek add --from-diff</code> and <code>diff-schema --script</code> write Oracle changes, with a temporary user on the same server as the shadow</li>
+  </ul>
+  <h3>Converting</h3>
+  <ul>
+    <li><code>trek convert</code> moves an Oracle schema to SQL Server, PostgreSQL, MySQL, MariaDB or SQLite, and any of them to Oracle: types mapped for 19c, names upper-cased (<code>--names upper</code>, new), identities and sequences continued past the copied rows, and views translated (<code>NVL</code>, <code>DECODE</code>, <code>ROWNUM</code>, <code>(+)</code> joins, <code>LISTAGG</code> ...). PL/SQL and PL/pgSQL are written commented out for review, for now. See <a href="{BASE}/docs/converting/#oracle">Converting</a></li>
+  </ul>
+  <h3>Moving from other tools</h3>
+  <ul>
+    <li><code>trek import flyway --provider oracle</code>, <code>trek import sqitch</code> (engine <code>oracle</code>) and <code>trek import ef</code> (Oracle.EntityFrameworkCore) make Oracle projects. Flyway's <code>jdbc:oracle:thin:</code> URLs become environments</li>
+    <li><code>trek baseline --from flyway</code>, <code>--from sqitch</code> and <code>--from ef</code> adopt Oracle databases those tools manage, reading their journals in the environment's schema. See <a href="{BASE}/docs/importing/">Moving from other tools</a></li>
+  </ul>
+  <h3>Also</h3>
+  <ul>
+    <li><code>THIRD-PARTY-NOTICES.md</code> ships with the package and the downloads, with the terms of Oracle's ODP.NET driver</li>
+    <li>Fixed: <code>trek init</code> ends the files it writes with a newline</li>
+  </ul>
+</section>
+
+<section class="release" id="v0.6.0">
+  <h2>Version 0.6.0 <span class="date">November 2026</span></h2>
   <h3>MySQL</h3>
   <ul>
     <li><code>trek init --provider mysql</code>, for MySQL 8.4 and 9.7, the LTS releases still supported. Deploy, revert, verify, repeatables, bundles, the schema fingerprint and <code>diff-schema</code> work as on the other databases. MySQL commits DDL as it runs, so changes run without a transaction and are recorded only when all of them ran. Scripts are split like the <code>mysql</code> client, with <code>DELIMITER</code> around stored program bodies. See <a href="{BASE}/docs/mysql/">MySQL</a></li>
