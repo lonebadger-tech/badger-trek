@@ -235,6 +235,24 @@ public sealed class ImportCommandTests : IDisposable
         Assert.Equal(0, Commands.ImportSqitch(G(target), sqitch, null, dryRun: false));
         Assert.Equal("oracle", TrekConfig.Load(target).Provider);
         Assert.Equal(0, Commands.PlanCheck(G(target)));
+
+        var dbup = Path.Combine(root, "dbup-ora");
+        Directory.CreateDirectory(dbup);
+        File.WriteAllText(Path.Combine(dbup, "001_create.sql"), "CREATE TABLE widget (id NUMBER(10))\n/\nCREATE OR REPLACE PROCEDURE touch_widget AS\nBEGIN\n  NULL;\nEND;\n/\n");
+        target = Path.Combine(root, "trek-ora-dbup");
+        Assert.Equal(0, Commands.ImportDbUp(G(target), dbup, fileNames: true, [], noVariables: false, dryRun: false, providerId: "oracle"));
+        Assert.Equal("oracle", TrekConfig.Load(target).Provider);
+        Assert.Equal(0, Commands.PlanCheck(G(target)));
+
+        var grate = Path.Combine(root, "grate-ora");
+        Directory.CreateDirectory(Path.Combine(grate, "up"));
+        Directory.CreateDirectory(Path.Combine(grate, "views"));
+        File.WriteAllText(Path.Combine(grate, "up", "0001_create.sql"), "CREATE TABLE gadget (id NUMBER(10) PRIMARY KEY, name VARCHAR2(50));\n");
+        File.WriteAllText(Path.Combine(grate, "views", "gadget_v.sql"), "CREATE OR REPLACE VIEW gadget_v AS SELECT id, name FROM gadget\n");
+        target = Path.Combine(root, "trek-ora-grate");
+        Assert.Equal(0, Commands.ImportGrate(G(target), grate, [], [], ignoreDirectoryNames: false, noTokens: false, dryRun: false, providerId: "oracle"));
+        Assert.Equal("oracle", TrekConfig.Load(target).Provider);
+        Assert.Equal(0, Commands.PlanCheck(G(target)));
     }
 
     [Fact]

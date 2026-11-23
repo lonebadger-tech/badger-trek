@@ -27,6 +27,15 @@ public static partial class ForeignJournal
     public const string SqitchDefaultTable = "changes";
     public const string GrateDefaultTable = "ScriptsRun";
 
+    /// <summary>DbUp's Oracle journal: created unquoted (so upper case) in the login's schema.</summary>
+    public const string DbUpOracleTable = "SCHEMAVERSIONS";
+
+    /// <summary>
+    /// grate's Oracle journal: Oracle has no schemas apart from users, so grate prefixes its tables with the schema
+    /// name (grate_ScriptsRun) and creates them unquoted in the login's schema.
+    /// </summary>
+    public const string GrateOracleTable = "GRATE_SCRIPTSRUN";
+
     public static async Task<IReadOnlyList<FlywayHistoryRow>> ReadFlywayAsync(IDatabaseSession session, IDatabaseProvider provider, string schema, string table, CancellationToken cancellationToken)
     {
         // Flyway quotes its column names on Oracle, so they are lower case there.
@@ -92,8 +101,16 @@ public static partial class ForeignJournal
     {
         var name = Table(provider, schema, table);
         var rows = await Query(session, $"SELECT script_name, text_hash, one_time_script FROM {name} sr WHERE id = (SELECT MAX(id) FROM {name} sr2 WHERE sr2.script_name = sr.script_name)", schema, table, "grate", cancellationToken).ConfigureAwait(false);
-        return rows.Select(r => new GrateScriptRun((string)r["script_name"]!, r["text_hash"] as string, System.Convert.ToBoolean(r["one_time_script"] ?? false, CultureInfo.InvariantCulture))).ToList();
+        return rows.Select(r => new GrateScriptRun((string)r["script_name"]!, r["text_hash"] as string, Flag(r["one_time_script"]))).ToList();
     }
+
+    /// <summary>grate's one_time_script: a bit or boolean, or CHAR(1) '1'/'0' on Oracle.</summary>
+    private static bool Flag(object? value) => value switch
+    {
+        null => false,
+        string s => s.Trim() is "1" or "Y" or "y" || bool.TryParse(s.Trim(), out var b) && b,
+        _ => System.Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+    };
 
     /// <summary>
     /// The last imported change grate ran (null when none). One-time (up/) scripts match by name among one-time rows;

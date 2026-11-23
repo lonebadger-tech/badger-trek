@@ -22,8 +22,9 @@ Delete this file when the items below are done (it is not documentation).
   (1) provider core: done in the oracle-provider PR; (2) add --from-diff / diff-schema --script: done in the
   oracle-from-diff PR (shadow user, model from the ALL_* views); (3) trek convert to and from Oracle in every direction: done in the oracle-convert PR (tables, keys,
   indexes, views, data; PL/SQL commented out); (4) imports (Flyway jdbc:oracle, Sqitch
-  oracle engine, EF Core Oracle provider) and baseline --from: done in the oracle-imports PR (DbUp and grate on
-  Oracle are not covered: their Oracle journals use other names). All four are done and shipped in 0.7.0.
+  oracle engine, EF Core Oracle provider) and baseline --from: done in the oracle-imports PR. All four are done and shipped in 0.7.0. DbUp
+  and grate on Oracle (SCHEMAVERSIONS, GRATE_SCRIPTSRUN in the login's schema; checked against dbup-oracle 6.2 and
+  grate 2.3 on 26ai) followed in 0.7.1. Still open: PL/SQL translation in convert; RoundhousE on Oracle needs --journal.
 
 - Dogfooding suggestions not done: `baseline --check-schema`, excluding objects from the schema fingerprint (e.g. an
   old EF/Flyway history table), DNS check before an Entra token in `doctor`, a `trek clone`.

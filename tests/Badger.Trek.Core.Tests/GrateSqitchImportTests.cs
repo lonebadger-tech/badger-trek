@@ -32,6 +32,9 @@ public sealed class GrateSqitchImportTests : IDisposable
     // text_hash values recorded by grate 2.1.6 (after token replacement; DatabaseName = GrDev).
     [Theory]
     [InlineData("-- Customer table for GrDev\nCREATE TABLE dbo.Customer (Id int NOT NULL CONSTRAINT PK_Customer PRIMARY KEY, Name nvarchar(100) NOT NULL, Tag nvarchar(20) NOT NULL CONSTRAINT DF_Customer_Tag DEFAULT (N'{x}'));\n", "mE097pFKfqfytzYE9AigPA==")]
+    // grate 2.3.0 on Oracle 26ai (GRATE_SCRIPTSRUN).
+    [InlineData("CREATE TABLE gadget (id NUMBER(10) PRIMARY KEY, name VARCHAR2(50))\n", "xLsrr1W8qI5wgxcVI6AUDg==")]
+    [InlineData("CREATE OR REPLACE VIEW gadget_v AS SELECT id, name FROM gadget\n", "jMQ6Sfz4GYZdaaLvXz1pmA==")]
     [InlineData("CREATE TABLE dbo.[Order] (Id int NOT NULL CONSTRAINT PK_Order PRIMARY KEY, CustomerId int NOT NULL CONSTRAINT FK_Order_Customer REFERENCES dbo.Customer (Id), Note nvarchar(50) NULL CONSTRAINT DF_Order_Note DEFAULT ('it''s'));\n", "2gxSgO2CICaz8x9Tg8gu1Q==")]
     public void Grate_hash_matches_grate(string script, string hash)
     {

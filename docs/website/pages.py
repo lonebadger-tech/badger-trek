@@ -180,6 +180,15 @@ def releases():
     body = f"""
 <section class="release" id="v{VERSION}">
   <h2>Version {VERSION} <span class="date">{RELEASE_DATE}</span></h2>
+  <h3>Moving from other tools</h3>
+  <ul>
+    <li><code>trek import dbup --provider oracle</code> and <code>trek import grate --provider oracle</code> make Oracle projects, and <code>trek baseline --from dbup</code> and <code>--from grate</code> adopt Oracle databases those tools manage: DbUp's <code>SCHEMAVERSIONS</code> and grate's <code>GRATE_SCRIPTSRUN</code> in the environment's schema. grate's hashes are checked as on the other databases. See <a href="{BASE}/docs/importing/#dbup">DbUp</a> and <a href="{BASE}/docs/importing/#grate">grate</a></li>
+    <li>Generated changes and <code>convert schema</code> leave grate's Oracle tables out</li>
+  </ul>
+</section>
+
+<section class="release" id="v0.7.0">
+  <h2>Version 0.7.0 <span class="date">November 2026</span></h2>
   <h3>Oracle</h3>
   <ul>
     <li><code>trek init --provider oracle</code>, for Oracle Database 19c and 26ai, the long-term releases in Oracle's Premier Support (26ai, through Oracle Database Free, is tested on every build; 19c is covered by <code>oracle.minVersion</code>, and lint TREK008 flags SQL only 26ai runs). Deploy, revert, verify, repeatables, bundles, the schema fingerprint and <code>diff-schema</code> work as on the other databases. See <a href="{BASE}/docs/oracle/">Oracle</a></li>

@@ -2,6 +2,12 @@
 
 All notable changes to Badger Trek. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). The website's [version history](https://lonebadger.tech/badger-trek/releases/) has the full release notes.
 
+## 0.7.1 (November 2026)
+
+### Added
+
+- Oracle: `trek import dbup --provider oracle` and `trek import grate --provider oracle` make Oracle projects, and `trek baseline --from dbup|grate` adopts Oracle databases those tools manage: DbUp's `SCHEMAVERSIONS` and grate's `GRATE_SCRIPTSRUN` (grate prefixes its tables with the schema name on Oracle) in the environment's schema, or `--journal`. grate's hashes are checked as on the other databases. `add --from-diff`, `diff-schema --script` and `convert schema` leave grate's Oracle tables out. RoundhousE on Oracle needs `--journal`.
+
 ## 0.7.0 (November 2026)
 
 ### Added

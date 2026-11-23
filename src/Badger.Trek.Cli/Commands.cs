@@ -709,7 +709,9 @@ public static partial class Commands
     }
 
     /// <summary>Other tools' journal tables, never part of a generated change.</summary>
-    private static readonly string[] DefaultScriptExclusions = ["*.flyway_schema_history", "*.SchemaVersions", "grate.*", "RoundhousE.*", "sqitch.*", "*.__EFMigrationsHistory"];
+    private static readonly string[] DefaultScriptExclusions = ["*.flyway_schema_history", "*.SchemaVersions", "grate.*", "RoundhousE.*", "sqitch.*", "*.__EFMigrationsHistory",
+        // grate on Oracle: grate_ScriptsRun, grate_ScriptsRunErrors, grate_Version and grate's own grate_grate* tables.
+        "*.grate_ScriptsRun*", "*.grate_Version", "*.grate_grate*"];
 
     /// <summary>
     /// Other tools' journal tables for this project. Sqitch keeps its Oracle registry in the login's own schema by default,
@@ -2035,22 +2037,28 @@ public static partial class Commands
 
     /// <summary>
     /// "schema.table" or "table", with each tool's default schema and table (RoundhousE: RoundhousE.ScriptsRun). An empty
-    /// schema means the session's own: on Oracle, Flyway, EF and Sqitch keep their journal in the login's schema by
-    /// default. Oracle stores unquoted names in upper case: a schema given in --journal is upper-cased unless "quoted",
-    /// and so is Sqitch's table (its registry is created unquoted, as CHANGES); Flyway's and EF's tables are quoted
-    /// names, used as written.
+    /// schema means the session's own: on Oracle, every tool keeps its journal in the login's schema by default (grate
+    /// as GRATE_SCRIPTSRUN, its schema name prefixed). Oracle stores unquoted names in upper case: a schema given in
+    /// --journal is upper-cased unless "quoted", and so are the tables of Sqitch, DbUp, grate and RoundhousE (created
+    /// unquoted: CHANGES, SCHEMAVERSIONS); Flyway's and EF's tables are quoted names, used as written.
     /// </summary>
     private static (string Schema, string Table) SplitTable(string? journal, string tool, IDatabaseProvider provider)
     {
         var oracle = provider.Id == OracleProvider.ProviderId;
-        var sqitch = string.Equals(tool, "sqitch", StringComparison.OrdinalIgnoreCase);
+        // Sqitch, DbUp, grate and RoundhousE create their tables unquoted, so upper case on Oracle.
+        var unquoted = tool.ToLowerInvariant() is "sqitch" or "dbup" or "grate" or "roundhouse";
         var (schema, table) = tool.ToLowerInvariant() switch
         {
+            "dbup" when oracle => (string.Empty, ForeignJournal.DbUpOracleTable),
+            "grate" when oracle => (string.Empty, ForeignJournal.GrateOracleTable),
+            "roundhouse" when oracle => string.IsNullOrWhiteSpace(journal)
+                ? throw new MigrationException("On Oracle, pass --journal with the name of RoundhousE's ScriptsRun table.")
+                : (string.Empty, ForeignJournal.GrateDefaultTable),
+            "sqitch" when oracle => (string.Empty, ForeignJournal.SqitchDefaultTable.ToUpperInvariant()),
             "dbup" => (provider.DefaultSchema, ForeignJournal.DbUpDefaultTable),
             "ef" => (provider.DefaultSchema, EfImporter.HistoryTable),
             "grate" => (ForeignJournal.GrateDefaultSchema, ForeignJournal.GrateDefaultTable),
             "roundhouse" => ("RoundhousE", ForeignJournal.GrateDefaultTable),
-            "sqitch" when oracle => (string.Empty, ForeignJournal.SqitchDefaultTable.ToUpperInvariant()),
             "sqitch" => (ForeignJournal.SqitchDefaultSchema, ForeignJournal.SqitchDefaultTable),
             _ => (provider.DefaultSchema, ForeignJournal.FlywayDefaultTable),
         };
@@ -2064,7 +2072,7 @@ public static partial class Commands
         if (oracle)
         {
             schema = schema.Length == 0 ? schema : OracleConnectionFactory.Normalize(schema);
-            table = sqitch ? OracleConnectionFactory.Normalize(table) : table.Length > 1 && table[0] == '"' && table[^1] == '"' ? table[1..^1] : table;
+            table = unquoted ? OracleConnectionFactory.Normalize(table) : table.Length > 1 && table[0] == '"' && table[^1] == '"' ? table[1..^1] : table;
         }
 
         return (schema, table);
