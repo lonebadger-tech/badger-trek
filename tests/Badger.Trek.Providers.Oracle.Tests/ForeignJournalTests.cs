@@ -4,8 +4,9 @@ using Badger.Trek.Core.Providers;
 namespace Badger.Trek.Providers.Oracle.Tests;
 
 /// <summary>
-/// 'trek baseline --from flyway|ef|sqitch' on Oracle: the journals as each tool creates them there (Flyway's and EF's
-/// with quoted names, Sqitch's registry unquoted, all in the login's schema), and EF's Oracle scripts as imported.
+/// 'trek baseline --from flyway|ef|sqitch|dbup|grate' on Oracle: the journals as each tool creates them there (Flyway's
+/// and EF's with quoted names; Sqitch's registry, DbUp's SCHEMAVERSIONS and grate's GRATE_SCRIPTSRUN unquoted; all in
+/// the login's schema), and EF's Oracle scripts as imported.
 /// </summary>
 [Collection("oracle")]
 public sealed class ForeignJournalTests(OracleFixture fixture)
@@ -117,5 +118,56 @@ public sealed class ForeignJournalTests(OracleFixture fixture)
 
         var left = await session.QueryAsync("SELECT table_name FROM user_tables ORDER BY table_name", null, CancellationToken.None);
         Assert.Equal(["__EFMigrationsHistory"], left.Select(r => (string)r["table_name"]!));
+    }
+
+    [SkippableFact]
+    public async Task DbUp_journal_is_read_from_schemaversions()
+    {
+        await using var db = await RequireSchemaAsync();
+        await using var session = await provider.OpenSessionAsync(db.Profile, SessionContext.Empty, CancellationToken.None);
+
+        // dbup-oracle 6.2's OracleTableJournal (the id comes from a sequence and trigger there).
+        await RunAsync(session, """
+            CREATE TABLE schemaversions (
+              schemaversionid NUMBER(10),
+              scriptname VARCHAR2(255) NOT NULL,
+              applied TIMESTAMP NOT NULL,
+              CONSTRAINT PK_SCHEMAVERSIONS PRIMARY KEY (schemaversionid)
+            );
+            insert into SCHEMAVERSIONS (schemaversionid, ScriptName, Applied) values (1, '001_create.sql', SYSTIMESTAMP);
+            insert into SCHEMAVERSIONS (schemaversionid, ScriptName, Applied) values (2, '002_seed.sql', SYSTIMESTAMP);
+            """);
+
+        var rows = await ForeignJournal.ReadDbUpAsync(session, provider, string.Empty, ForeignJournal.DbUpOracleTable, CancellationToken.None);
+
+        Assert.Equal(["001_create.sql", "002_seed.sql"], rows.Order(StringComparer.Ordinal));
+    }
+
+    [SkippableFact]
+    public async Task Grate_journal_is_read_from_the_prefixed_table()
+    {
+        await using var db = await RequireSchemaAsync();
+        await using var session = await provider.OpenSessionAsync(db.Profile, SessionContext.Empty, CancellationToken.None);
+
+        // The columns trek reads from grate 2.3's Oracle GRATE_SCRIPTSRUN; one_time_script is CHAR(1) there.
+        await RunAsync(session, """
+            CREATE TABLE GRATE_SCRIPTSRUN (
+              id NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              version_id NUMBER(19),
+              script_name VARCHAR2(255),
+              text_of_script CLOB,
+              text_hash VARCHAR2(512),
+              one_time_script CHAR(1) DEFAULT '0'
+            );
+            INSERT INTO GRATE_SCRIPTSRUN (version_id, script_name, text_hash, one_time_script) VALUES (1, '0001_create.sql', 'xLsrr1W8qI5wgxcVI6AUDg==', '1');
+            INSERT INTO GRATE_SCRIPTSRUN (version_id, script_name, text_hash, one_time_script) VALUES (1, 'gadget_v.sql', 'old', '0');
+            INSERT INTO GRATE_SCRIPTSRUN (version_id, script_name, text_hash, one_time_script) VALUES (2, 'gadget_v.sql', 'jMQ6Sfz4GYZdaaLvXz1pmA==', '0');
+            """);
+
+        var rows = await ForeignJournal.ReadGrateAsync(session, provider, string.Empty, ForeignJournal.GrateOracleTable, CancellationToken.None);
+
+        Assert.Equal(
+            [new GrateScriptRun("0001_create.sql", "xLsrr1W8qI5wgxcVI6AUDg==", true), new GrateScriptRun("gadget_v.sql", "jMQ6Sfz4GYZdaaLvXz1pmA==", false)],
+            rows.OrderBy(r => r.ScriptName, StringComparer.Ordinal));
     }
 }

@@ -1288,7 +1288,7 @@ trek baseline --from flyway -e prod --journal app.flyway_history''')}
 
 <h2 id="dbup">DbUp</h2>
 {sh('''trek import dbup ./src/App.Database/Scripts -C db --var schemaName=app --run-always "Always/**"
-trek baseline --from dbup -C db -e prod                    # reads dbo.SchemaVersions''')}
+trek baseline --from dbup -C db -e prod                    # reads dbo.SchemaVersions (Oracle: SCHEMAVERSIONS)''')}
 <p>DbUp's scripts and options live in code, so tell the import what the code does:</p>
 <table>
 <tr><th>DbUp</th><th>trek import</th></tr>
@@ -1298,6 +1298,7 @@ trek baseline --from dbup -C db -e prod                    # reads dbo.SchemaVer
 <tr><td><code>$name$</code> variables, <code>WithVariable("name", value)</code></td><td><code>{{name}}</code> variables; pass the values with <code>--var name=value</code>, or add them to <code>trek.yaml</code> afterwards (<code>plan check</code> fails until every variable has a value). <code>--no-variables</code> if the code calls <code>WithVariablesDisabled()</code>.</td></tr>
 </table>
 <p>DbUp has no down scripts, so every change is <code>!irreversible</code>. DbUp runs without a transaction unless configured to; trek runs each change in one, and <code>trek plan check</code> lists any statement that needs <code>!notx</code>.</p>
+<p>On Oracle (<code>--provider oracle</code>, for dbup-oracle projects), baseline reads <code>SCHEMAVERSIONS</code> in the environment's schema; pass <code>--journal SCHEMA.TABLE</code> if the code calls <code>JournalToOracleTable</code>. trek splits scripts the SQL*Plus way, so a PL/SQL block needs a <code>/</code> line after it, as with DbUp's default <code>/</code> delimiter.</p>
 
 <h2 id="ef">Entity Framework Core</h2>
 {sh('''trek import ef ./src/Shop.Data -C db                    # runs dotnet ef in that project
@@ -1318,7 +1319,7 @@ dotnet ef migrations script <LastMigration> 0 -o down.sql''')}
 
 <h2 id="grate">grate and RoundhousE</h2>
 {sh('''trek import grate ./db -C trek-db --var AppRole=app_reader
-trek baseline --from grate -C trek-db -e TEST                 # reads grate.ScriptsRun
+trek baseline --from grate -C trek-db -e TEST                 # reads grate.ScriptsRun (Oracle: GRATE_SCRIPTSRUN)
 trek baseline --from roundhouse -C trek-db -e TEST            # reads RoundhousE.ScriptsRun''')}
 <p>Point the import at the folder you pass to grate as <code>--sqlfilesdirectory</code>. grate's folders run in a fixed order, and the import keeps it:</p>
 <table>
@@ -1333,6 +1334,7 @@ trek baseline --from roundhouse -C trek-db -e TEST            # reads RoundhousE
 </table>
 <p>Renamed folders: <code>--folder up=ddl</code>. If grate ran with <code>--ignoredirectorynames</code> or <code>--disabletokenreplacement</code>, pass <code>--ignore-directory-names</code> or <code>--no-tokens</code>.</p>
 <p>grate records a hash of each script after replacing its tokens, so <code>baseline --from grate</code> renders every imported script with this environment's variables and compares: a mismatch means the database ran different text (or a token now has another value), and baseline stops. Repeatables and environment scripts grate already ran with the same text are recorded as applied, so they do not run again. <code>runAfterCreateDatabase/</code> scripts may be missing from the journal: grate only runs them for databases it created.</p>
+<p>On Oracle (<code>--provider oracle</code>), grate keeps its tables in the login's schema with the schema name as a prefix, so baseline reads <code>GRATE_SCRIPTSRUN</code> there (<code>--journal APP_SCRIPTSRUN</code> if grate ran with <code>--schema app</code>), and generated changes leave grate's tables out. For RoundhousE on Oracle, pass the table with <code>--journal</code>.</p>
 
 <h2 id="sqitch">Sqitch</h2>
 {sh('''trek import sqitch ./flipr -C trek-db
@@ -1592,7 +1594,7 @@ environments:
       mode: strict                      # TCPS, checking the server's name
     connectionProperties:               # any ODP.NET connection-string keyword
       Wallet_Location: /etc/oracle/wallet''', "trek.yaml")}
-<p>The plan, hash certification, revert from stored scripts, environments, variables, repeatables, bundles, <code>verify</code>, <code>diff-schema</code> and generated changes (<code>add --from-diff</code>, <code>diff-schema --script</code>) work as on the other databases. <code>trek convert</code> moves an Oracle schema to SQL Server, PostgreSQL, MySQL, MariaDB or SQLite and back ({link('docs/converting/#oracle', 'Converting: Oracle')}). Flyway, Sqitch and EF Core projects import into Oracle projects, and <code>trek baseline --from</code> reads their journals in the environment's schema ({link('docs/importing/', 'Importing')}).</p>
+<p>The plan, hash certification, revert from stored scripts, environments, variables, repeatables, bundles, <code>verify</code>, <code>diff-schema</code> and generated changes (<code>add --from-diff</code>, <code>diff-schema --script</code>) work as on the other databases. <code>trek convert</code> moves an Oracle schema to SQL Server, PostgreSQL, MySQL, MariaDB or SQLite and back ({link('docs/converting/#oracle', 'Converting: Oracle')}). Flyway, DbUp, grate, Sqitch and EF Core projects import into Oracle projects, and <code>trek baseline --from</code> reads their journals in the environment's schema ({link('docs/importing/', 'Importing')}).</p>
 
 <h2 id="connecting">Connecting</h2>
 <p><code>host</code>, <code>port</code> and <code>database</code> (the service name, such as a pluggable database) build the connection, or <code>connectionString</code> takes an ODP.NET connection string whose <code>Data Source</code> is EZConnect (<code>host:port/service</code>), a TNS alias or a full descriptor. <code>tls.mode: mandatory</code> or <code>strict</code> connects over TCPS (strict also checks the server's name against its certificate); the certificates come from an Oracle wallet, named with <code>connectionProperties: Wallet_Location</code>, which is also how Autonomous Database connects. SSH tunnels work with <code>host</code> and <code>database</code>. Sign-in is by password.</p>
