@@ -8,10 +8,10 @@ namespace Badger.Trek.Conversion.Oracle;
 /// <summary>
 /// PostgreSQL to Oracle, and the last step of every other source to Oracle. Expressions (defaults, checks, virtual
 /// columns, index expressions) and views are printed as Oracle 19c SQL by <see cref="SqlPrinter"/>: no BOOLEAN type,
-/// FROM DUAL, OFFSET / FETCH, MINUS. Functions, procedures and triggers are written commented out for now: PL/pgSQL is
-/// not translated to PL/SQL yet.
+/// FROM DUAL, OFFSET / FETCH, MINUS. Functions, procedures and trigger functions are written as PL/SQL by
+/// <see cref="PlWriter"/> (PgToOracle.Code.cs).
 /// </summary>
-internal sealed class PgToOracleTranslator(ConversionContext ctx) : ITranslator
+internal sealed partial class PgToOracleTranslator(ConversionContext ctx) : ITranslator
 {
     public string Expression(string expression, ExpressionSite site) =>
         Translate(expression, site, "NULL", (printer, e) => printer.Expr(e));
@@ -66,9 +66,21 @@ internal sealed class PgToOracleTranslator(ConversionContext ctx) : ITranslator
         }
         else
         {
-            // PL/pgSQL to PL/SQL is not translated yet.
-            issues.Add($"{code.Kind.ToString().ToLowerInvariant()} not translated; rewrite it for Oracle");
-            script = Review.CommentedOut(code.Definition, Review.Comment("not translated; rewrite it for Oracle"));
+            try
+            {
+                script = code.Kind == PortableCodeKind.Trigger ? Trigger(code, all, issues) : Routine(code, issues, ref folder);
+            }
+            catch (PgParseException ex)
+            {
+                issues.Add($"could not parse: {ex.Message}");
+                script = Review.CommentedOut(code.Definition, Review.Comment("not translated; rewrite it for Oracle"));
+            }
+
+            if (script.Length == 0)
+            {
+                // A trigger function: written into each trigger that uses it.
+                return new TranslatedCode(code, string.Empty, string.Empty, string.Empty, []);
+            }
         }
 
         issues = issues.Distinct().ToList();

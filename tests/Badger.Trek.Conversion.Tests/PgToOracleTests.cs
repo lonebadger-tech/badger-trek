@@ -289,18 +289,15 @@ public class PgToOracleTests(ITestOutputHelper output)
         Assert.Contains(result.Issues, i => i.StartsWith("could not parse", StringComparison.Ordinal));
     }
 
-    [Theory]
-    [InlineData(PortableCodeKind.Function, "functions")]
-    [InlineData(PortableCodeKind.Procedure, "procedures")]
-    [InlineData(PortableCodeKind.Trigger, "triggers")]
-    public void Routines_and_triggers_are_written_commented_out_for_review(PortableCodeKind kind, string folder)
+    [Fact]
+    public void A_routine_in_another_language_is_written_commented_out_for_review()
     {
-        var code = new PortableCode(kind, new PortableName("public", "touch"), "CREATE OR REPLACE FUNCTION public.touch()\n RETURNS void\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  UPDATE orders SET updated = now();\nEND;\n$function$");
+        var code = new PortableCode(PortableCodeKind.Function, new PortableName("public", "touch"), "CREATE OR REPLACE FUNCTION public.touch()\n RETURNS void\n LANGUAGE plpython3u\nAS $function$\nplpy.execute('UPDATE orders SET updated = now()')\n$function$");
         var result = Translate(code);
-        Assert.Equal(folder, result.Folder);
+        Assert.Equal("functions", result.Folder);
         Assert.Equal("TOUCH.sql", result.FileName);
         Assert.Contains("REVIEW trek convert: not translated; rewrite it for Oracle", result.Script, StringComparison.Ordinal);
-        Assert.Contains("--   UPDATE orders SET updated = now();", result.Script, StringComparison.Ordinal);
+        Assert.Contains(result.Issues, i => i.Contains("LANGUAGE plpython3u", StringComparison.Ordinal));
     }
 
     [Fact]

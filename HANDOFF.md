@@ -24,7 +24,7 @@ Delete this file when the items below are done (it is not documentation).
   indexes, views, data; PL/SQL commented out); (4) imports (Flyway jdbc:oracle, Sqitch
   oracle engine, EF Core Oracle provider) and baseline --from: done in the oracle-imports PR. All four are done and shipped in 0.7.0. DbUp
   and grate on Oracle (SCHEMAVERSIONS, GRATE_SCRIPTSRUN in the login's schema; checked against dbup-oracle 6.2 and
-  grate 2.3 on 26ai) followed in 0.7.1. Still open: PL/SQL translation in convert; RoundhousE on Oracle needs --journal.
+  grate 2.3 on 26ai) followed in 0.7.1. PL/SQL translation in convert (functions, procedures, triggers both ways, Oracle/PostgreSQL and through PL/pgSQL to SQL Server) and failing deploys on Oracle compile errors followed in 0.8.0. Still open: Oracle packages, pipelined functions, compound triggers, BULK COLLECT/FORALL; MySQL routines are still not translated in any direction; RoundhousE on Oracle needs --journal.
 
 - Dogfooding suggestions not done: `baseline --check-schema`, excluding objects from the schema fingerprint (e.g. an
   old EF/Flyway history table), DNS check before an Entra token in `doctor`, a `trek clone`.

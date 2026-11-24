@@ -228,4 +228,35 @@ public sealed class OracleFeatureTests(OracleFixture fixture)
             """);
         Assert.Equal("R&D; done", (await session.QueryAsync("SELECT msg FROM log_entry", null, CancellationToken.None))[0]["msg"]);
     }
+
+    [SkippableFact]
+    public async Task Plsql_that_does_not_compile_fails_the_statement()
+    {
+        await using var db = await RequireSchemaAsync();
+        await using var session = await provider.OpenSessionAsync(db.Profile, SessionContext.Empty, CancellationToken.None);
+
+        // Oracle reports success and keeps the procedure INVALID: trek reads its errors and fails instead.
+        var error = await Assert.ThrowsAsync<MigrationException>(() => session.ExecuteAsync(
+            "-- converted\nCREATE OR REPLACE PROCEDURE broken AS\nBEGIN\n  UPDATE no_such_table SET x = 1;\nEND;",
+            null,
+            CancellationToken.None));
+        Assert.Contains("PROCEDURE BROKEN was created with compilation errors", error.Message, StringComparison.Ordinal);
+        Assert.Contains("ORA-00942", error.Message, StringComparison.Ordinal);
+
+        await session.ExecuteAsync("CREATE OR REPLACE PROCEDURE fixed AS\nBEGIN\n  NULL;\nEND;", null, CancellationToken.None);
+        Assert.Equal("VALID", (await session.QueryAsync("SELECT status FROM user_objects WHERE object_name = 'FIXED'", null, CancellationToken.None))[0]["status"]);
+    }
+
+    [Theory]
+    [InlineData("CREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END;", null, "P", "PROCEDURE")]
+    [InlineData("-- header\n/* note */ create editionable function \"Mixed\".\"fn\" return number is begin return 1; end;", "Mixed", "fn", "FUNCTION")]
+    [InlineData("CREATE OR REPLACE PACKAGE BODY app.billing AS END;", "APP", "BILLING", "PACKAGE BODY")]
+    [InlineData("CREATE TRIGGER t BEFORE INSERT ON x BEGIN NULL; END;", null, "T", "TRIGGER")]
+    [InlineData("CREATE TABLE t (id NUMBER)", null, null, null)]
+    [InlineData("CREATE OR REPLACE VIEW v AS SELECT 1 x FROM dual", null, null, null)]
+    public void Created_plsql_objects_are_recognised(string sql, string? owner, string? name, string? type)
+    {
+        var created = OracleSession.CreatedPlSql(sql);
+        Assert.Equal(name is null ? null : (owner, name, type!), created);
+    }
 }

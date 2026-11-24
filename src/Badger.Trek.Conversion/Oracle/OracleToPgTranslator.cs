@@ -8,9 +8,9 @@ namespace Badger.Trek.Conversion.Oracle;
 /// Oracle to PostgreSQL, and the first step of Oracle to every other target. Expressions (DATA_DEFAULT, check
 /// conditions, virtual columns) and views (CREATE VIEW, or ALL_VIEWS.TEXT alone) are parsed in Oracle mode, where an
 /// unquoted name is upper case as Oracle stores it, and printed as PostgreSQL with names mapped like the tables'.
-/// Functions, procedures, packages and triggers are written commented out for now: PL/SQL is not translated yet.
+/// Functions, procedures and triggers are written as PL/pgSQL (OracleToPg.Code.cs); packages are written commented out.
 /// </summary>
-internal sealed class OracleToPgTranslator(ConversionContext ctx) : IIntermediateTranslator
+internal sealed partial class OracleToPgTranslator(ConversionContext ctx) : IIntermediateTranslator
 {
     public string Expression(string expression, ExpressionSite site) => Translate(expression, site, predicate: false);
 
@@ -63,9 +63,9 @@ internal sealed class OracleToPgTranslator(ConversionContext ctx) : IIntermediat
             // Unparsable: passed on commented out, so the next step writes it for review too.
             result.Add(code with { Name = ctx.TargetName(code.Name), Definition = Review.CommentedOut(code.Definition, Review.Comment("not translated; rewrite it for PostgreSQL")) });
         }
-        else
+        else if (PlSql(code, issues) is { } pieces)
         {
-            issues.Add(NotTranslated(code));
+            result.AddRange(pieces);
         }
 
         foreach (var issue in issues.Distinct())
@@ -84,13 +84,13 @@ internal sealed class OracleToPgTranslator(ConversionContext ctx) : IIntermediat
         {
             script = $"CREATE OR REPLACE VIEW {view.Name}{view.Columns} AS\n{view.Body}{(view.CheckOption ? "\nWITH CHECK OPTION" : string.Empty)};\n";
         }
+        else if (code.Kind != PortableCodeKind.View && PlSql(code, issues) is { } pieces)
+        {
+            // A routine, or a trigger's function then its CREATE TRIGGER.
+            script = string.Join('\n', pieces.Select(p => p.Definition));
+        }
         else
         {
-            if (code.Kind != PortableCodeKind.View)
-            {
-                issues.Add(NotTranslated(code));
-            }
-
             script = Review.CommentedOut(code.Definition, Review.Comment("not translated; rewrite it for PostgreSQL"));
         }
 
@@ -110,9 +110,6 @@ internal sealed class OracleToPgTranslator(ConversionContext ctx) : IIntermediat
         };
         return new TranslatedCode(code, folder, $"{target.Schema}.{target.Name}.sql", SqliteToPgTranslator.Header(ctx.SourceDisplay, code, issues) + script.TrimEnd() + "\n", issues);
     }
-
-    private string NotTranslated(PortableCode code) =>
-        $"{ctx.SourceDisplay} {code.Kind.ToString().ToLowerInvariant()} not translated (PL/SQL is not translated yet); rewrite it for PostgreSQL";
 
     /// <summary>The view's PostgreSQL name, column list and query, or null (with an issue) when it cannot be parsed.</summary>
     private (string Name, string Columns, string Body, bool CheckOption)? View(PortableCode code, List<string> issues)

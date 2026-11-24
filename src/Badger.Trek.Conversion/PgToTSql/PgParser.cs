@@ -223,10 +223,11 @@ internal sealed class PgParser
         return e;
     }
 
-    private PgBlock Block(string? label)
+    /// <param name="implicitDeclarations">PL/SQL routines: declarations follow IS / AS without DECLARE.</param>
+    private PgBlock Block(string? label, bool implicitDeclarations = false)
     {
         var declarations = new List<PgDeclaration>();
-        if (AcceptWord("declare"))
+        if (implicitDeclarations || AcceptWord("declare"))
         {
             while (!AtEnd && !IsWord("begin"))
             {
@@ -261,7 +262,12 @@ internal sealed class PgParser
         }
 
         ExpectWord("end");
-        if (Peek().Kind == TokenKind.Word && !IsPunct(";"))
+        if (oracle && Peek().Kind is TokenKind.Word or TokenKind.QuotedIdent)
+        {
+            // PL/SQL: END name; (the routine's or the block's label).
+            pos++;
+        }
+        else if (Peek().Kind == TokenKind.Word && !IsPunct(";"))
         {
             AcceptWord(label ?? "\0");
         }
@@ -279,7 +285,18 @@ internal sealed class PgParser
                 throw Error("label in DECLARE");
             }
 
+            if (oracle && OracleDeclaration(start) is { } plsql)
+            {
+                return plsql;
+            }
+
             var name = Identifier();
+            if (oracle && AcceptWord("exception"))
+            {
+                ExpectPunct(";");
+                return new PgDeclaration(name, null, null, false, false) { Special = "exception" };
+            }
+
             if (AcceptWord("alias"))
             {
                 ExpectWord("for");
@@ -331,6 +348,47 @@ internal sealed class PgParser
             SkipTo(";");
             return new PgDeclaration(name, null, null, false, false) { Special = "unparsed: " + SourceFrom(start) };
         }
+    }
+
+    /// <summary>
+    /// PL/SQL declarations PostgreSQL writes differently: CURSOR c IS query (the query is kept as the default, a
+    /// subquery), PRAGMA ... (kept as text); TYPE and SUBTYPE are not translated.
+    /// </summary>
+    private PgDeclaration? OracleDeclaration(int start)
+    {
+        if (AcceptWord("pragma"))
+        {
+            SkipTo(";");
+            return new PgDeclaration("pragma", null, null, false, false) { Special = "pragma " + SourceFrom(start) };
+        }
+
+        if (AcceptWord("cursor"))
+        {
+            var name = Identifier();
+            if (IsPunct("("))
+            {
+                throw Error("cursor parameters");
+            }
+
+            if (AcceptWord("return"))
+            {
+                TypeName();
+                AcceptPunct("%");
+                AcceptWord("rowtype");
+            }
+
+            ExpectWord("is");
+            var query = Query();
+            ExpectPunct(";");
+            return new PgDeclaration(name, null, new PgSubquery(query), false, false) { Special = "cursor" };
+        }
+
+        if (IsWord("type") || IsWord("subtype"))
+        {
+            throw Error($"{Peek().Value.ToUpperInvariant()} declaration");
+        }
+
+        return null;
     }
 
     private void SkipTo(string punct)
@@ -488,6 +546,11 @@ internal sealed class PgParser
                 case "execute":
                 {
                     pos++;
+                    if (oracle)
+                    {
+                        ExpectWord("immediate");
+                    }
+
                     var sql = Expr();
                     var into = new List<PgExpr>();
                     var usingArgs = new List<PgExpr>();
@@ -574,6 +637,48 @@ internal sealed class PgParser
                 }
 
                 case "case":
+                    return CaseStatement();
+                case "open" when oracle && Peek(1).Kind is TokenKind.Word or TokenKind.QuotedIdent && IsPunct(";", 2):
+                {
+                    pos++;
+                    var cursor = Identifier();
+                    ExpectPunct(";");
+                    return new PgOpen(cursor);
+                }
+
+                case "close" when oracle:
+                {
+                    pos++;
+                    var cursor = Identifier();
+                    ExpectPunct(";");
+                    return new PgClose(cursor);
+                }
+
+                case "fetch" when oracle:
+                {
+                    pos++;
+                    var cursor = Identifier();
+                    if (AcceptWords("bulk", "collect"))
+                    {
+                        throw Error("FETCH ... BULK COLLECT");
+                    }
+
+                    ExpectWord("into");
+                    var into = ExprList();
+                    if (IsWord("limit"))
+                    {
+                        throw Error("FETCH ... LIMIT");
+                    }
+
+                    ExpectPunct(";");
+                    return new PgFetch(cursor, into);
+                }
+
+                case "commit" or "rollback" when IsPunct(";", 1) || (IsWord("work", 1) && IsPunct(";", 2)):
+                    pos++;
+                    AcceptWord("work");
+                    ExpectPunct(";");
+                    return new PgTransaction(t.Value.ToUpperInvariant());
                 case "open":
                 case "fetch":
                 case "close":
@@ -581,8 +686,24 @@ internal sealed class PgParser
                 case "foreach":
                 case "commit":
                 case "rollback":
+                case "goto":
+                case "forall":
+                case "pipe":
                     throw Error($"{t.Value.ToUpperInvariant()} statement");
             }
+        }
+
+        // PL/SQL calls a procedure by name: p(args); pkg.p; DBMS_OUTPUT.PUT_LINE(x);
+        if (oracle && t.Kind is TokenKind.Word or TokenKind.QuotedIdent)
+        {
+            var start = pos;
+            var target = Postfix(Primary());
+            if (target is PgCall or PgName && AcceptPunct(";"))
+            {
+                return new PgCallStatement(target as PgCall ?? new PgCall((PgName)target, []));
+            }
+
+            pos = start;
         }
 
         // Assignment: target := value (target may be a.b or a[i]).
@@ -607,12 +728,44 @@ internal sealed class PgParser
 
     private PgExpr PrimaryName()
     {
+        if (oracle && IsPunct(":") && Peek(1).Kind is TokenKind.Word or TokenKind.QuotedIdent)
+        {
+            // :NEW.col := ... in a trigger.
+            pos++;
+        }
+
         if (!(Peek().Kind is TokenKind.Word or TokenKind.QuotedIdent))
         {
             throw Error("expected a statement");
         }
 
         return QualifiedName();
+    }
+
+    /// <summary>CASE [selector] WHEN x THEN statements ... [ELSE statements] END CASE;</summary>
+    private PgStatement CaseStatement()
+    {
+        ExpectWord("case");
+        var input = IsWord("when") ? null : Expr();
+        var whens = new List<(PgExpr, IReadOnlyList<PgStatement>)>();
+        while (AcceptWord("when"))
+        {
+            var when = Expr();
+            ExpectWord("then");
+            whens.Add((when, Statements("when", "end")));
+        }
+
+        if (whens.Count == 0)
+        {
+            throw Error("expected WHEN");
+        }
+
+        List<PgStatement>? elseBody = AcceptWord("else") ? Statements("end") : null;
+        ExpectWord("end");
+        ExpectWord("case");
+        AcceptLabel();
+        ExpectPunct(";");
+        return new PgCaseStatement(input, whens, elseBody);
     }
 
     private PgStatement If()
@@ -658,6 +811,34 @@ internal sealed class PgParser
 
         ExpectWord("in");
         var reverse = AcceptWord("reverse");
+        if (oracle && Peek().Kind is TokenKind.Word or TokenKind.QuotedIdent && IsWord("loop", 1))
+        {
+            // PL/SQL: FOR r IN cursor LOOP.
+            var cursor = Identifier();
+            ExpectWord("loop");
+            var body = Statements("end");
+            ExpectWord("end");
+            ExpectWord("loop");
+            AcceptLabel();
+            ExpectPunct(";");
+            return new PgForQuery(label, variable, null, null, body) { Cursor = cursor };
+        }
+
+        if (oracle && IsPunct("(") && (IsWord("select", 1) || IsWord("with", 1)))
+        {
+            // PL/SQL: FOR r IN (query) LOOP.
+            pos++;
+            var q = Query();
+            ExpectPunct(")");
+            ExpectWord("loop");
+            var body = Statements("end");
+            ExpectWord("end");
+            ExpectWord("loop");
+            AcceptLabel();
+            ExpectPunct(";");
+            return new PgForQuery(label, variable, q, null, body);
+        }
+
         if (IsWord("select") || IsWord("with") || IsWord("values"))
         {
             var q = Query();
@@ -697,7 +878,11 @@ internal sealed class PgParser
         ExpectWord("loop");
         AcceptLabel();
         ExpectPunct(";");
-        return new PgForRange(label, variable, from, to, step, reverse, rangeBody);
+
+        // PL/SQL's REVERSE lo..hi counts down from hi; PL/pgSQL's REVERSE hi..lo does, so the tree keeps PL/pgSQL's order.
+        return oracle && reverse
+            ? new PgForRange(label, variable, to, from, step, reverse, rangeBody)
+            : new PgForRange(label, variable, from, to, step, reverse, rangeBody);
     }
 
     private PgStatement Return()
@@ -1648,7 +1833,13 @@ internal sealed class PgParser
     {
         while (true)
         {
-            if (AcceptPunct("::"))
+            if (oracle && IsPunct("%") && e is PgName attributeOf && Peek(1).Kind == TokenKind.Word && Peek(1).Value is "rowcount" or "found" or "notfound" or "isopen")
+            {
+                // SQL%ROWCOUNT, c%NOTFOUND ...: one name, "sql%rowcount", for the emitter to replace.
+                pos++;
+                e = new PgName([string.Join('.', attributeOf.Parts).ToLowerInvariant() + "%" + Next().Value]);
+            }
+            else if (AcceptPunct("::"))
             {
                 e = new PgCast(e, TypeName());
             }
@@ -1780,6 +1971,13 @@ internal sealed class PgParser
     private PgExpr Primary()
     {
         var t = Peek();
+        if (oracle && t.Text == ":" && Peek(1).Kind is TokenKind.Word or TokenKind.QuotedIdent)
+        {
+            // :NEW.col and :OLD.col in a trigger (other bind variables are read as plain names).
+            pos++;
+            return QualifiedName();
+        }
+
         switch (t.Kind)
         {
             case TokenKind.Number:
@@ -2572,6 +2770,210 @@ internal sealed class PgParser
 
         var parts = values.Select((v, i) => $"{(negative ? "-" : string.Empty)}{v} {units[units.Length - values.Count + i]}");
         return new PgTypedLiteral("interval", string.Join(' ', parts));
+    }
+
+    // ------------------------------------------------------------------ PL/SQL routines and triggers
+
+    /// <summary>A PL/SQL CREATE FUNCTION or PROCEDURE, as ALL_SOURCE holds it after CREATE OR REPLACE.</summary>
+    public OracleRoutineDef OracleRoutine()
+    {
+        ExpectWord("create");
+        AcceptWords("or", "replace");
+        _ = AcceptWord("editionable") || AcceptWord("noneditionable");
+        var procedure = AcceptWord("procedure");
+        if (!procedure)
+        {
+            ExpectWord("function");
+        }
+
+        var name = QualifiedName();
+        var args = new List<RoutineArg>();
+        if (AcceptPunct("("))
+        {
+            do
+            {
+                var argName = Identifier();
+                var mode = "in";
+                if (AcceptWord("in"))
+                {
+                    mode = AcceptWord("out") ? "inout" : "in";
+                }
+                else if (AcceptWord("out"))
+                {
+                    mode = "out";
+                }
+
+                AcceptWord("nocopy");
+                var type = OracleType();
+                PgExpr? value = AcceptPunct(":=") || AcceptWord("default") ? Expr() : null;
+                args.Add(new RoutineArg(mode, argName, type, value));
+            }
+            while (AcceptPunct(","));
+
+            ExpectPunct(")");
+        }
+
+        string? returns = null;
+        if (!procedure)
+        {
+            ExpectWord("return");
+            returns = OracleType();
+        }
+
+        var pipelined = false;
+        while (!AtEnd && !IsWord("is") && !IsWord("as"))
+        {
+            // AUTHID, DETERMINISTIC, PARALLEL_ENABLE, RESULT_CACHE (RELIES_ON (...)), ACCESSIBLE BY (...), PIPELINED.
+            pipelined |= IsWord("pipelined");
+            if (Next().IsPunct("("))
+            {
+                pos--;
+                SkipParens();
+            }
+        }
+
+        if (!AcceptWord("is"))
+        {
+            ExpectWord("as");
+        }
+
+        if (IsWord("language") || IsWord("external"))
+        {
+            throw Error("an external (Java or C) routine");
+        }
+
+        var body = Block(null, implicitDeclarations: true);
+        AcceptPunct(";");
+        return new OracleRoutineDef(name, procedure, args, returns, pipelined, body);
+    }
+
+    /// <summary>A PL/SQL CREATE TRIGGER on a table or view (not compound, not on a schema or database event).</summary>
+    public OracleTriggerDef OracleTrigger()
+    {
+        ExpectWord("create");
+        AcceptWords("or", "replace");
+        _ = AcceptWord("editionable") || AcceptWord("noneditionable");
+        ExpectWord("trigger");
+        var name = QualifiedName().Last;
+        if (IsWord("for"))
+        {
+            // CREATE TRIGGER t FOR UPDATE ON x COMPOUND TRIGGER ...
+            throw Error("a compound trigger");
+        }
+
+        string timing;
+        if (AcceptWord("before"))
+        {
+            timing = "BEFORE";
+        }
+        else if (AcceptWord("after"))
+        {
+            timing = "AFTER";
+        }
+        else
+        {
+            ExpectWord("instead");
+            ExpectWord("of");
+            timing = "INSTEAD OF";
+        }
+
+        var events = new List<string>();
+        var updateOf = new List<string>();
+        do
+        {
+            if (AcceptWord("insert"))
+            {
+                events.Add("INSERT");
+            }
+            else if (AcceptWord("delete"))
+            {
+                events.Add("DELETE");
+            }
+            else
+            {
+                ExpectWord("update");
+                events.Add("UPDATE");
+                if (AcceptWord("of"))
+                {
+                    do
+                    {
+                        updateOf.Add(Identifier());
+                    }
+                    while (AcceptPunct(","));
+                }
+            }
+        }
+        while (AcceptWord("or"));
+
+        ExpectWord("on");
+        var table = QualifiedName();
+        var referencing = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (AcceptWord("referencing"))
+        {
+            while (IsWord("new") || IsWord("old"))
+            {
+                var which = Next().Value;
+                AcceptWord("as");
+                referencing[Identifier()] = which;
+            }
+        }
+
+        var row = AcceptWords("for", "each", "row");
+        while (AcceptWord("follows") || AcceptWord("precedes"))
+        {
+            QualifiedName();
+            while (AcceptPunct(","))
+            {
+                QualifiedName();
+            }
+        }
+
+        _ = AcceptWord("enable") || AcceptWord("disable");
+        PgExpr? when = null;
+        if (AcceptWord("when"))
+        {
+            ExpectPunct("(");
+            when = Expr();
+            ExpectPunct(")");
+        }
+
+        if (IsWord("compound"))
+        {
+            throw Error("a compound trigger");
+        }
+
+        if (IsWord("call"))
+        {
+            throw Error("a CALL trigger");
+        }
+
+        var body = Block(null);
+        AcceptPunct(";");
+        return new OracleTriggerDef(name, timing, events, updateOf, table, row, when, referencing, body);
+    }
+
+    /// <summary>A PL/SQL argument, return or variable type: NUMBER(10), VARCHAR2, t.col%TYPE, t%ROWTYPE.</summary>
+    private string OracleType()
+    {
+        var type = TypeName();
+        if (IsPunct("%") && (IsWord("type", 1) || IsWord("rowtype", 1)))
+        {
+            pos++;
+            type += "%" + Next().Value;
+        }
+
+        return type;
+    }
+
+    private void SkipParens()
+    {
+        ExpectPunct("(");
+        var depth = 1;
+        while (!AtEnd && depth > 0)
+        {
+            var t = Next();
+            depth += t.IsPunct("(") ? 1 : t.IsPunct(")") ? -1 : 0;
+        }
     }
 
     // ------------------------------------------------------------------ CREATE FUNCTION / PROCEDURE headers

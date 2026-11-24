@@ -173,7 +173,11 @@ internal sealed record PgWhile(string? Label, PgExpr Condition, IReadOnlyList<Pg
 
 internal sealed record PgForRange(string? Label, string Variable, PgExpr From, PgExpr To, PgExpr? Step, bool Reverse, IReadOnlyList<PgStatement> Body) : PgStatement;
 
-internal sealed record PgForQuery(string? Label, string Variable, PgQuery? Query, PgExpr? Dynamic, IReadOnlyList<PgStatement> Body) : PgStatement;
+internal sealed record PgForQuery(string? Label, string Variable, PgQuery? Query, PgExpr? Dynamic, IReadOnlyList<PgStatement> Body) : PgStatement
+{
+    /// <summary>FOR r IN cursor LOOP: the declared cursor it loops over (Query and Dynamic are null).</summary>
+    public string? Cursor { get; init; }
+}
 
 internal sealed record PgExit(bool Continue, string? Label, PgExpr? When) : PgStatement;
 
@@ -206,3 +210,30 @@ internal sealed record PgHandler(IReadOnlyList<string> Conditions, IReadOnlyList
 internal sealed record PgBlock(string? Label, IReadOnlyList<PgDeclaration> Declarations, IReadOnlyList<PgStatement> Body, IReadOnlyList<PgHandler> Handlers) : PgStatement;
 
 internal sealed record PgRaw(string Why) : PgStatement;
+
+/// <summary>CASE [x] WHEN ... THEN statements ... [ELSE statements] END CASE (PL/pgSQL and PL/SQL).</summary>
+internal sealed record PgCaseStatement(PgExpr? Input, IReadOnlyList<(PgExpr When, IReadOnlyList<PgStatement> Body)> Whens, IReadOnlyList<PgStatement>? Else) : PgStatement;
+
+/// <summary>OPEN cursor (PL/SQL).</summary>
+internal sealed record PgOpen(string Cursor) : PgStatement;
+
+/// <summary>FETCH cursor INTO targets (PL/SQL).</summary>
+internal sealed record PgFetch(string Cursor, IReadOnlyList<PgExpr> Into) : PgStatement;
+
+/// <summary>CLOSE cursor (PL/SQL).</summary>
+internal sealed record PgClose(string Cursor) : PgStatement;
+
+/// <summary>COMMIT or ROLLBACK inside a procedure.</summary>
+internal sealed record PgTransaction(string Command) : PgStatement;
+
+/// <summary>
+/// A PL/SQL CREATE FUNCTION or PROCEDURE: arguments (mode in, out or inout), RETURN type, and the body as one block whose
+/// declarations are those between IS / AS and BEGIN.
+/// </summary>
+internal sealed record OracleRoutineDef(PgName Name, bool Procedure, IReadOnlyList<RoutineArg> Args, string? Returns, bool Pipelined, PgBlock Body);
+
+/// <summary>
+/// A PL/SQL CREATE TRIGGER: timing (BEFORE, AFTER, INSTEAD OF), events (INSERT, UPDATE, DELETE), UPDATE OF columns, the
+/// table, FOR EACH ROW, the WHEN condition, REFERENCING aliases (alias → "new" or "old") and the body.
+/// </summary>
+internal sealed record OracleTriggerDef(string Name, string Timing, IReadOnlyList<string> Events, IReadOnlyList<string> UpdateOf, PgName Table, bool Row, PgExpr? When, IReadOnlyDictionary<string, string> Referencing, PgBlock Body);

@@ -94,6 +94,23 @@ public sealed class OracleConversionTests(Servers servers) : IDisposable
 
     private static long Long(object? value) => Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
 
+    /// <summary>Every converted routine and trigger compiled: Oracle creates PL/SQL with errors as an INVALID object.</summary>
+    private static async Task AssertAllValid(OracleConnection db)
+    {
+        // Objects whose tables changed after they were created wait INVALID for their next use; compile them now.
+        await Execute(db, "BEGIN DBMS_UTILITY.COMPILE_SCHEMA(USER, FALSE); END;");
+        await using var command = new OracleCommand("SELECT name || ' (' || type || ') line ' || line || ': ' || text FROM user_errors ORDER BY name, sequence", db);
+        await using var reader = await command.ExecuteReaderAsync();
+        var errors = new List<string>();
+        while (await reader.ReadAsync())
+        {
+            errors.Add(reader.GetString(0));
+        }
+
+        Assert.True(errors.Count == 0, string.Join('\n', errors));
+        Assert.Equal(0L, Long(await Scalar(db, "SELECT COUNT(*) FROM user_objects WHERE status <> 'VALID'")));
+    }
+
     [SkippableFact]
     public async Task PostgreSql_to_Oracle()
     {
@@ -114,6 +131,18 @@ public sealed class OracleConversionTests(Servers servers) : IDisposable
         await Assert.ThrowsAsync<OracleException>(() => Execute(db, "INSERT INTO app_orders (customer_id, total, status) VALUES (1, 1, 'bogus')"));
         await Assert.ThrowsAsync<OracleException>(() => Execute(db, "INSERT INTO app_orders (customer_id, total) VALUES (1, -1)"));
         Assert.Equal(2L, Long(await Scalar(db, "SELECT orders FROM app_customer_totals WHERE id = 1")));
+
+        // The functions, procedure and triggers became PL/SQL that compiles and runs.
+        await AssertAllValid(db);
+        Assert.Equal(2L, Long(await Scalar(db, "SELECT app_order_count(1) FROM DUAL")));
+        Assert.Equal("Ada Lovelace <ada@example.com>", await Scalar(db, "SELECT app_display_name(name, email) FROM app_customers WHERE id = 1"));
+        await Execute(db, "UPDATE app_orders SET total = total + 1 WHERE id = 1");
+        Assert.Equal(1L, Long(await Scalar(db, "SELECT COUNT(*) FROM app_orders WHERE id = 1 AND updated_at IS NOT NULL")));
+        Assert.Equal(1L, Long(await Scalar(db, "SELECT COUNT(*) FROM app_order_log WHERE order_id = 4 AND event = 'created'")));
+        await Execute(db, "DECLARE n NUMBER; BEGIN n := app_mark_paid(4); END;");
+        await Assert.ThrowsAsync<OracleException>(() => Execute(db, "DECLARE n NUMBER; BEGIN n := app_mark_paid(4); END;"));
+        await Execute(db, "BEGIN app_ship_all; END;");
+        Assert.Equal("shipped", await Scalar(db, "SELECT status FROM app_orders WHERE id = 4"));
     }
 
     [SkippableFact]
@@ -128,6 +157,15 @@ public sealed class OracleConversionTests(Servers servers) : IDisposable
         Assert.Equal("tab\tand\nnewline \\ backslash", await Scalar(db, "SELECT notes FROM sales_customer WHERE customerid = 1"));
         Assert.Equal("unicode ✓", await Scalar(db, "SELECT notes FROM sales_customer WHERE customerid = 3"));
         Assert.Equal(1L, Long(await Scalar(db, "SELECT COUNT(*) FROM sales_customertotals WHERE customerid = 1")));
+
+        // T-SQL routines and triggers reach PL/SQL by way of PL/pgSQL, compile and run.
+        await AssertAllValid(db);
+        Assert.Equal("Ada Lovelace", await Scalar(db, "SELECT sales_fullname(firstname, lastname) FROM sales_customer WHERE customerid = 1"));
+        await Execute(db, "DECLARE id NUMBER; BEGIN sales_placeorder(1, 'Widget', 2, 3.50, id); END;");
+        Assert.Equal(7.00m, Convert.ToDecimal(await Scalar(db, "SELECT total FROM sales_order WHERE orderid = (SELECT MAX(orderid) FROM sales_order)"), System.Globalization.CultureInfo.InvariantCulture));
+        await Assert.ThrowsAsync<OracleException>(() => Execute(db, "DECLARE id NUMBER; BEGIN sales_placeorder(2, 'Widget', 1, 1, id); END;"));
+        await Execute(db, "UPDATE sales_order SET total = total + 1 WHERE customerid = 1");
+        Assert.True(Long(await Scalar(db, "SELECT COUNT(*) FROM sales_orderaudit")) > 0);
     }
 
     [SkippableFact]
@@ -184,6 +222,18 @@ public sealed class OracleConversionTests(Servers servers) : IDisposable
         Assert.True(Convert.ToInt64(await Scalar("SELECT ticket FROM orders WHERE id = 4")) > 1002);
         await Assert.ThrowsAsync<PostgresException>(() => new NpgsqlCommand("INSERT INTO customers (name, tier) VALUES ('x', 'gold')", pg).ExecuteNonQueryAsync());
         Assert.Equal("yes", await Scalar("SELECT paying FROM customer_totals WHERE id = 1"));
+
+        // PL/SQL became PL/pgSQL: the function, the procedure (its errors keep their numbers as SQLSTATE TK001, TK002)
+        // and the trigger.
+        Assert.Equal(2m, await Scalar("SELECT order_count(1)"));
+        await new NpgsqlCommand("CALL close_order(1)", pg).ExecuteNonQueryAsync();
+        Assert.Equal("closed", await Scalar("SELECT status FROM orders WHERE id = 1"));
+        Assert.Equal(2L, await Scalar("SELECT count(*) FROM order_events WHERE order_id = 1"));
+        Assert.Equal(1L, await Scalar("SELECT count(*) FROM order_events WHERE event = 'status open to closed'"));
+        var closed = await Assert.ThrowsAsync<PostgresException>(() => new NpgsqlCommand("CALL close_order(1)", pg).ExecuteNonQueryAsync());
+        Assert.Equal("TK001", closed.SqlState);
+        var missing = await Assert.ThrowsAsync<PostgresException>(() => new NpgsqlCommand("CALL close_order(99)", pg).ExecuteNonQueryAsync());
+        Assert.Equal("TK002", missing.SqlState);
     }
 
     [SkippableFact]
@@ -203,6 +253,13 @@ public sealed class OracleConversionTests(Servers servers) : IDisposable
         Assert.Equal(4m, await Scalar("INSERT INTO dbo.CUSTOMERS (NAME) VALUES (N'New'); SELECT SCOPE_IDENTITY();"));
         await Assert.ThrowsAsync<SqlException>(() => new SqlCommand("INSERT INTO dbo.CUSTOMERS (NAME, TIER) VALUES (N'x', N'gold')", ss).ExecuteNonQueryAsync());
         Assert.Equal(2, Convert.ToInt32(await Scalar("SELECT ORDERS FROM dbo.CUSTOMER_TOTALS WHERE ID = 1")));
+
+        // PL/SQL reaches T-SQL by way of PL/pgSQL.
+        Assert.Equal(2, Convert.ToInt32(await Scalar("SELECT dbo.ORDER_COUNT(1)")));
+        await new SqlCommand("EXEC dbo.CLOSE_ORDER @P_ID = 3", ss).ExecuteNonQueryAsync();
+        Assert.Equal("closed", await Scalar("SELECT STATUS FROM dbo.ORDERS WHERE ID = 3"));
+        Assert.True(Convert.ToInt32(await Scalar("SELECT COUNT(*) FROM dbo.ORDER_EVENTS WHERE ORDER_ID = 3")) > 0);
+        await Assert.ThrowsAsync<SqlException>(() => new SqlCommand("EXEC dbo.CLOSE_ORDER @P_ID = 3", ss).ExecuteNonQueryAsync());
     }
 
     [SkippableFact]
