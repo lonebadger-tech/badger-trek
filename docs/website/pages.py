@@ -180,6 +180,20 @@ def releases():
     body = f"""
 <section class="release" id="v{VERSION}">
   <h2>Version {VERSION} <span class="date">{RELEASE_DATE}</span></h2>
+  <h3>Converting: PL/SQL</h3>
+  <ul>
+    <li><code>trek convert</code> translates Oracle functions, procedures and triggers to PL/pgSQL, and PostgreSQL's to PL/SQL, statement by statement, so converted projects no longer arrive with their code commented out. SQL Server's T-SQL reaches Oracle, and Oracle's PL/SQL reaches SQL Server, by way of PL/pgSQL. See <a href="{BASE}/docs/converting/#oracle">Converting: Oracle</a></li>
+    <li>The differences are bridged, not just the syntax: <code>SELECT INTO</code> with no row (an error in Oracle, NULL in PostgreSQL), <code>RAISE_APPLICATION_ERROR</code> numbers kept as SQLSTATEs (<code>-20001</code> is <code>TK001</code>), <code>SQL%ROWCOUNT</code> and <code>FOUND</code>, <code>:NEW</code> and <code>NEW</code>, <code>INSERTING</code> and <code>TG_OP</code>, and statement triggers over transition tables as row triggers</li>
+    <li>Packages, pipelined functions, compound triggers and <code>BULK COLLECT</code> are still written commented out for review</li>
+  </ul>
+  <h3>Oracle</h3>
+  <ul>
+    <li>A procedure, function, package, trigger or type that does not compile now fails the deploy with Oracle's errors. Oracle creates such an object INVALID and reports success, so deploys used to go on with it</li>
+  </ul>
+</section>
+
+<section class="release" id="v0.7.1">
+  <h2>Version 0.7.1 <span class="date">November 2026</span></h2>
   <h3>Moving from other tools</h3>
   <ul>
     <li><code>trek import dbup --provider oracle</code> and <code>trek import grate --provider oracle</code> make Oracle projects, and <code>trek baseline --from dbup</code> and <code>--from grate</code> adopt Oracle databases those tools manage: DbUp's <code>SCHEMAVERSIONS</code> and grate's <code>GRATE_SCRIPTSRUN</code> in the environment's schema. grate's hashes are checked as on the other databases. See <a href="{BASE}/docs/importing/#dbup">DbUp</a> and <a href="{BASE}/docs/importing/#grate">grate</a></li>

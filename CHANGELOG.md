@@ -2,6 +2,16 @@
 
 All notable changes to Badger Trek. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). The website's [version history](https://lonebadger.tech/badger-trek/releases/) has the full release notes.
 
+## 0.8.0 (November 2026)
+
+### Added
+
+- `trek convert` translates Oracle functions, procedures and triggers to PL/pgSQL and PostgreSQL's to PL/SQL, statement by statement, instead of writing them commented out; T-SQL reaches PL/SQL and PL/SQL reaches T-SQL by way of PL/pgSQL. Declarations (`%TYPE`, `%ROWTYPE`, cursors), `IF`, `CASE`, loops, exception handlers and `COMMIT` carry over; `SELECT INTO` keeps Oracle's behaviour with no row (`INTO STRICT`, or a `NO_DATA_FOUND` handler the other way), `RAISE_APPLICATION_ERROR(-20001, ...)` becomes SQLSTATE `TK001` and back, `SQL%ROWCOUNT` / `FOUND`, `DBMS_OUTPUT.PUT_LINE` / `RAISE NOTICE` and `p();` / `CALL p()` map to each other, and a trigger becomes a trigger function and `CREATE TRIGGER` (or one Oracle trigger; statement triggers over transition tables, and SQL Server's triggers, become row triggers). Packages, pipelined and set-returning functions, compound triggers, `BULK COLLECT` and `FORALL` are still written commented out for review.
+
+### Changed
+
+- Oracle: a procedure, function, package, trigger or type that does not compile fails the statement (and the deploy) with the compiler's errors from `ALL_ERRORS`. Oracle creates such objects INVALID and reports success, so deploys used to continue with them.
+
 ## 0.7.1 (November 2026)
 
 ### Added

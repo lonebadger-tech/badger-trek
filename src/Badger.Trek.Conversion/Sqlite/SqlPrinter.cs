@@ -46,6 +46,12 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
     /// <summary>Names replaced while printing (PL/pgSQL variables, TG_OP): lowercase name → SQL.</summary>
     public Dictionary<string, string> NameReplacements { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Print SELECT ... INTO targets (routine bodies); otherwise INTO is left out.</summary>
+    public bool PrintInto { get; set; }
+
+    /// <summary>Written before NEW.col and OLD.col: ":" in the body of an Oracle trigger, nothing elsewhere.</summary>
+    public string NewOldPrefix { get; set; } = string.Empty;
+
     /// <summary>
     /// The alias of an UPDATE or DELETE target, written as the table name: SQLite rejects an alias on the target
     /// table of a statement inside a trigger, the only place converted statements run.
@@ -56,7 +62,7 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
     {
         if (!toSqlite || alias is null)
         {
-            return print(alias is null ? string.Empty : " AS " + ctx.Ident(alias));
+            return print(alias is null ? string.Empty : (toOracle ? " " : " AS ") + ctx.Ident(alias));
         }
 
         targetAliases[alias] = Table(table);
@@ -173,7 +179,7 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
         if (n.Parts.Count == 2 && (n.Parts[0].Equals("new", StringComparison.OrdinalIgnoreCase) || n.Parts[0].Equals("old", StringComparison.OrdinalIgnoreCase)))
         {
-            return n.Parts[0].ToUpperInvariant() + "." + ctx.Ident(n.Parts[1]);
+            return NewOldPrefix + n.Parts[0].ToUpperInvariant() + "." + ctx.Ident(n.Parts[1]);
         }
 
         if (n.Parts.Count >= 3)
@@ -188,7 +194,15 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
     // ------------------------------------------------------------------ expressions
 
     /// <summary>An expression where a value is expected. Oracle (19c) has no boolean values: a condition becomes CASE WHEN ... THEN 1.</summary>
-    public string Expr(PgExpr e) => toOracle && IsCondition(e) ? BooleanValue(e) : ExprCore(e);
+    public string Expr(PgExpr e) => toOracle && (IsCondition(e) || IsBooleanName(e)) ? BooleanValue(e) : ExprCore(e);
+
+    /// <summary>
+    /// PL/SQL BOOLEAN names (variables, SQL%FOUND) in a routine body: lowercase name. Oracle SQL has no booleans, but
+    /// PL/SQL does, so these are conditions as they are and need CASE only where a value is expected.
+    /// </summary>
+    public HashSet<string> BooleanNames { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    private bool IsBooleanName(PgExpr e) => BooleanNames.Count > 0 && Unparen(e) is PgName { Parts.Count: 1 } n && BooleanNames.Contains(n.Last);
 
     /// <summary>An expression where a condition is expected (WHERE, ON, HAVING, CASE WHEN, AND / OR / NOT operands, CHECK).</summary>
     public string Cond(PgExpr e) => toOracle ? OracleCondition(e) : Expr(e);
@@ -1213,6 +1227,10 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
         }
 
         sb.Append(s.Targets.Count == 0 ? "NULL" : string.Join(", ", s.Targets.Select(t => Expr(t.Expr) + (t.Alias is null ? string.Empty : " AS " + ctx.Ident(t.Alias)))));
+        if (PrintInto && s.Into.Count > 0)
+        {
+            sb.Append(" INTO ").Append(s.IntoStrict && toPg ? "STRICT " : string.Empty).Append(string.Join(", ", s.Into.Select(Expr)));
+        }
         if (s.From.Count > 0)
         {
             sb.Append(" FROM ").Append(string.Join(", ", s.From.Select(From)));
@@ -1405,12 +1423,17 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
                 ? $"SELECT {string.Join(", ", row.Select(Expr))} WHERE {guard}"
                 : $"SELECT * FROM ({Query(i.Rows)}) WHERE {guard}";
         }
+        else if (toOracle && i.Rows is { With.Count: 0, OrderBy.Count: 0, Limit: null, Offset: null, Body: PgValuesBody { Rows: [var single] } })
+        {
+            // One row stays VALUES (...): Oracle takes RETURNING ... INTO only there, not after INSERT ... SELECT.
+            source = $"VALUES ({string.Join(", ", single.Select(Expr))})";
+        }
         else
         {
             source = Query(i.Rows!);
         }
 
-        return $"{WithPrefix(i.With)}{verb} INTO {Table(i.Table)}{(i.Alias is null ? string.Empty : " AS " + ctx.Ident(i.Alias))}{columns} {source}{conflict}{Returning(i.Returning)};";
+        return $"{WithPrefix(i.With)}{verb} INTO {Table(i.Table)}{(i.Alias is null ? string.Empty : (toOracle ? " " : " AS ") + ctx.Ident(i.Alias))}{columns} {source}{conflict}{Returning(i.Returning)};";
     }
 
     public string Update(PgUpdate u, string? guard = null) => WithoutTargetAlias(u.Alias, u.Table, alias => Update(u, guard, alias));
@@ -1429,7 +1452,9 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
 
         var sets = string.Join(", ", u.Sets.Select(s => $"{ctx.Ident(s.Column)} = {Expr(s.Value)}"));
         var where = Where(u.Where, guard);
-        var from = u.From.Count == 0 ? string.Empty : " FROM " + string.Join(", ", u.From.Select(From));
+        var from = u.From.Count == 0 ? string.Empty
+            : toOracle ? Note("UPDATE ... FROM has no Oracle form: rewrite it as MERGE or with correlated subqueries") + " FROM " + string.Join(", ", u.From.Select(From))
+            : " FROM " + string.Join(", ", u.From.Select(From));
         return $"{WithPrefix(u.With)}UPDATE {Table(u.Table)}{alias} SET {sets}{from}{where}{Returning(u.Returning)};";
     }
 
@@ -1444,13 +1469,15 @@ internal sealed partial class SqlPrinter(ConversionContext ctx, List<string> iss
             return $"{WithPrefix(d.With)}DELETE FROM {Table(d.Table)}{alias}{Where(new PgRawExpr(exists), guard, raw: exists)}{Returning(d.Returning)};";
         }
 
-        var usingList = d.Using.Count == 0 ? string.Empty : " USING " + string.Join(", ", d.Using.Select(From));
+        var usingList = d.Using.Count == 0 ? string.Empty
+            : toOracle ? Note("DELETE ... USING has no Oracle form: rewrite it with EXISTS") + " USING " + string.Join(", ", d.Using.Select(From))
+            : " USING " + string.Join(", ", d.Using.Select(From));
         return $"{WithPrefix(d.With)}DELETE FROM {Table(d.Table)}{alias}{usingList}{Where(d.Where, guard)}{Returning(d.Returning)};";
     }
 
     private string Where(PgExpr? where, string? guard, string? raw = null)
     {
-        var condition = raw ?? (where is null ? null : Expr(where));
+        var condition = raw ?? (where is null ? null : Cond(where));
         return (condition, guard) switch
         {
             (null, null) => string.Empty,

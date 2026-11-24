@@ -257,20 +257,17 @@ public class OracleToPgTests(ITestOutputHelper output)
         Assert.Contains(result.Issues, i => i.Contains("CONNECT BY", StringComparison.Ordinal));
     }
 
-    [Theory]
-    [InlineData(PortableCodeKind.Function, "functions")]
-    [InlineData(PortableCodeKind.Procedure, "procedures")]
-    [InlineData(PortableCodeKind.Trigger, "triggers")]
-    public void Routines_packages_and_triggers_are_written_commented_out_for_review(PortableCodeKind kind, string folder)
+    [Fact]
+    public void A_compound_trigger_is_written_commented_out_for_review()
     {
-        var code = new PortableCode(kind, new PortableName("SHOP", "TOUCH"), "CREATE OR REPLACE PROCEDURE \"SHOP\".\"TOUCH\" AS\nBEGIN\n  UPDATE orders SET updated = SYSTIMESTAMP;\nEND;");
+        var code = new PortableCode(PortableCodeKind.Trigger, new PortableName("SHOP", "AUDIT"), "CREATE OR REPLACE TRIGGER audit FOR UPDATE ON orders COMPOUND TRIGGER\n  AFTER EACH ROW IS BEGIN NULL; END AFTER EACH ROW;\nEND audit;") { Table = new PortableName("SHOP", "ORDERS") };
         var translator = new OracleToPgTranslator(Schemas.OracleToPg());
         var result = translator.Code(code, [code]);
         output.WriteLine(result.Script);
-        Assert.Equal(folder, result.Folder);
-        Assert.Equal("public.touch.sql", result.FileName);
+        Assert.Equal("triggers", result.Folder);
+        Assert.Equal("public.audit.sql", result.FileName);
         Assert.Contains("REVIEW trek convert: not translated; rewrite it for PostgreSQL", result.Script, StringComparison.Ordinal);
-        Assert.Contains("--   UPDATE orders SET updated = SYSTIMESTAMP;", result.Script, StringComparison.Ordinal);
+        Assert.Contains(result.Issues, i => i.Contains("compound trigger", StringComparison.Ordinal));
         Assert.Empty(translator.Intermediate(code, [code]));
     }
 

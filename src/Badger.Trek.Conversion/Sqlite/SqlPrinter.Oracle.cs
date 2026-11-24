@@ -55,7 +55,7 @@ internal sealed partial class SqlPrinter
         PgCall { Function.Parts: ["("] } p => "(" + OracleCondition(p.Args[0]) + ")",
         PgLiteral { Kind: LiteralKind.True } => "1 = 1",
         PgLiteral { Kind: LiteralKind.False or LiteralKind.Null } => "1 = 0",
-        _ when IsCondition(e) => ExprCore(e),
+        _ when IsCondition(e) || IsBooleanName(e) => ExprCore(e),
 
         // A boolean column (NUMBER(1)), or anything else that gives a boolean in PostgreSQL.
         _ => $"{Expr(e)} = 1",
@@ -1041,6 +1041,13 @@ internal sealed partial class SqlPrinter
 
         switch (name)
         {
+            case "updating" when args.Count == 1 && StringArg(args[0]) is { } updatedColumn:
+            {
+                // Trigger predicate UPDATING('COL'): the column was in the SET list; the nearest test is a changed value.
+                var column = ctx.Ident(updatedColumn.ToUpperInvariant());
+                return $"(TG_OP = 'UPDATE' AND NEW.{column} IS DISTINCT FROM OLD.{column})" + Note($"UPDATING('{updatedColumn}') became a test that the value changed; Oracle's is true whenever the UPDATE sets the column");
+            }
+
             case "nvl" when args.Count == 2:
                 return $"coalesce({All()})";
             case "nvl2" when args.Count == 3:

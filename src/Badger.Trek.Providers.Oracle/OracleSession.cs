@@ -1,4 +1,5 @@
 using System.Data;
+using Badger.Trek.Core;
 using Badger.Trek.Core.Providers;
 using Oracle.ManagedDataAccess.Client;
 
@@ -9,7 +10,7 @@ namespace Badger.Trek.Providers.Oracle;
 /// VARCHAR2 can hold bind as CLOB; DateTimeOffset binds as a UTC TIMESTAMP and bool as 1/0. LONG columns (view text,
 /// defaults) are read whole.
 /// </summary>
-public sealed class OracleSession : IDatabaseSession
+public sealed partial class OracleSession : IDatabaseSession
 {
     /// <summary>Longest string bound as VARCHAR2; longer ones bind as CLOB.</summary>
     private const int MaxVarchar = 2000;
@@ -88,9 +89,54 @@ public sealed class OracleSession : IDatabaseSession
 
     public async Task ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken cancellationToken)
     {
-        await using var command = CreateCommand(sql, parameters);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using (var command = CreateCommand(sql, parameters))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (CreatedPlSql(sql) is { } created)
+        {
+            await ThrowIfInvalidAsync(created.Owner, created.Name, created.Type, cancellationToken).ConfigureAwait(false);
+        }
     }
+
+    /// <summary>
+    /// Oracle keeps PL/SQL that does not compile as an INVALID object and reports success (ORA-24344 is only a warning),
+    /// so a deploy would go on with a broken procedure. Its errors (ALL_ERRORS) fail the statement instead.
+    /// </summary>
+    private async Task ThrowIfInvalidAsync(string? owner, string name, string type, CancellationToken cancellationToken)
+    {
+        var errors = await QueryAsync(
+            """
+            SELECT line, position, text FROM all_errors
+             WHERE owner = NVL(:owner, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')) AND name = :name AND type = :type AND attribute = 'ERROR'
+             ORDER BY sequence
+            """,
+            new Dictionary<string, object?> { ["owner"] = owner, ["name"] = name, ["type"] = type },
+            cancellationToken).ConfigureAwait(false);
+        if (errors.Count > 0)
+        {
+            var lines = errors.Take(10).Select(e => $"line {e["line"]}, column {e["position"]}: {((string?)e["text"])?.Trim()}");
+            throw new MigrationException($"{type} {name} was created with compilation errors:\n  {string.Join("\n  ", lines)}{(errors.Count > 10 ? $"\n  ... {errors.Count - 10} more" : string.Empty)}");
+        }
+    }
+
+    /// <summary>The PL/SQL object a CREATE statement makes (owner when qualified, name and type as ALL_ERRORS has them), or null.</summary>
+    internal static (string? Owner, string Name, string Type)? CreatedPlSql(string sql)
+    {
+        var m = CreatePlSqlRegex().Match(sql);
+        if (!m.Success)
+        {
+            return null;
+        }
+
+        static string Name(string n) => n.StartsWith('"') ? n[1..^1] : n.ToUpperInvariant();
+        var type = System.Text.RegularExpressions.Regex.Replace(m.Groups["type"].Value.ToUpperInvariant(), @"\s+", " ");
+        return (m.Groups["owner"].Success ? Name(m.Groups["owner"].Value) : null, Name(m.Groups["name"].Value), type);
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\A(?:\s|--[^\n]*\n|/\*.*?\*/)*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?(?<type>PROCEDURE|FUNCTION|PACKAGE\s+BODY|PACKAGE|TRIGGER|TYPE\s+BODY|TYPE)\s+(?:(?<owner>""[^""]+""|[A-Za-z][\w$#]*)\s*\.\s*)?(?<name>""[^""]+""|[A-Za-z][\w$#]*)", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline)]
+    private static partial System.Text.RegularExpressions.Regex CreatePlSqlRegex();
 
     public async Task<IReadOnlyList<IReadOnlyDictionary<string, object?>>> QueryAsync(string sql, IReadOnlyDictionary<string, object?>? parameters, CancellationToken cancellationToken)
     {
